@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>打砖块 · 单文件像素游戏</title>
+<style>
+  :root{
+    --bg:#0b0e14; --ink:#e8eef7; --dim:#7b8798;
+    --c1:#4cc2ff; --c2:#ff5fa2; --c3:#ffc857; --hi:#8ef0c8;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#05070b;overflow:hidden}
+  body{
+    font:13px/1.5 ui-monospace,"Cascadia Mono",Consolas,monospace;
+    color:var(--ink);
+  }
+  /* stage 承载两层：canvas 走位图放大，ui 走矢量缩放。
+     两者分离是中文小字能看清的关键 —— 低分辨率位图上的 12px 中文会糊。 */
+  #stage{position:absolute;left:0;top:0;transform-origin:0 0}
+  #world{display:block;image-rendering:pixelated;background:var(--bg)}
+  #ui{
+    position:absolute;left:0;top:0;width:640px;height:360px;
+    transform-origin:0 0;pointer-events:none;overflow:hidden;
+  }
+
+  .hud{
+    position:absolute;left:0;top:0;width:100%;
+    display:flex;justify-content:space-between;align-items:center;
+    padding:8px 14px;font-size:14px;letter-spacing:.06em;
+  }
+  .hud b{font-weight:500;color:var(--dim);font-size:12px}
+  .hud .v{color:var(--ink)}
+  #hudLives{color:var(--c2);letter-spacing:.15em;min-width:56px;text-align:right}
+  #hudLevel{min-width:56px;text-align:center}
+
+  .overlay{
+    position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:10px;
+    background:rgba(5,7,11,.82);text-align:center;padding:24px;
+  }
+  .overlay:not(.on){display:none}
+  /* 父层的 pointer-events:none 拦不住子元素。整棵子树一起失活才安全，
+     否则隐藏面板里的按钮仍会接住点击（"打一半突然重开一局"就是这么来的）。 */
+  .overlay:not(.on) *{pointer-events:none}
+  .overlay.on{pointer-events:auto}
+  #ovTitle{font-size:26px;font-weight:500;letter-spacing:.1em}
+  #ovBody{color:var(--dim);font-size:13px;max-width:420px;line-height:1.8}
+  #ovHint{color:var(--hi);font-size:12px;margin-top:6px;letter-spacing:.08em}
+  .keys{color:var(--c3)}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="world" width="640" height="360"></canvas>
+  <div id="ui">
+    <div class="hud">
+      <span><b id="lblScore">分数</b> <span class="v" id="hudScore">0</span></span>
+      <span id="hudLevel">1 / 5</span>
+      <span><b id="lblLives">球</b> <span id="hudLives">♥♥♥</span></span>
+    </div>
+    <div id="ov" class="overlay on">
+      <h1 id="ovTitle">打砖块</h1>
+      <p id="ovBody">移动鼠标或按 ← → 控制挡板。<br>球撞到挡板的位置决定反弹角度 —— 用边缘可以打出斜球。</p>
+      <p id="ovHint">按 空格 开始</p>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+
+/* #region CORE
+   纯算法区：不碰 DOM、不碰 canvas、不读全局状态。
+   这里的每个函数都能在没有浏览器的情况下单独跑，所以 tests/core.test.mjs
+   能把这一整段抠出来直接做性质断言。写这一段时如果发现需要 window，
+   说明逻辑放错地方了 —— 把它挪到下面的游戏层去。 */
+const CORE = (function () {
+
+  /** mulberry32：小而快的确定性伪随机数。所有游戏逻辑都走它，
+   *  这样同一个种子必然复现同一局 —— 既是测试稳定的前提，
+   *  也是一个可以卖给玩家的特性（分享种子就能让别人玩到同一局）。 */
+  function makeRNG(seed) {
+    let a = (seed >>> 0) || 1;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /* 关卡用字符画描述：'.' 空，数字 = 砖块耐久。
+     把它写成数据而不是代码，是这类游戏最值得学的一课 ——
+     "加一关"变成"多打一行字"，不需要碰任何逻辑。 */
+  const LEVELS = [
+    ['111111111111',
+     '111111111111',
+     '111111111111'],
+
+    ['1.1.1.1.1.1.',
+     '.1.1.1.1.1.1',
+     '1.1.1.1.1.1.',
+     '.1.1.1.1.1.1'],
+
+    ['.....22.....',
+     '....2222....',
+     '...222222...',
+     '..22222222..',
+     '.2222222222.',
+     '222222222222'],
+
+    ['333333333333',
+     '3..........3',
+     '3..222222..3',
+     '3..2....2..3',
+     '3..222222..3',
+     '3..........3',
+     '333333333333'],
+
+    ['3.2.3.3.2.3.',
+     '.3.2.2.3.2.3',
+     '2.3.1.1.3.2.',
+     '.2.1.3.1.2.2',
+     '3.1.3.3.1.3.',
+     '.3.3.2.3.3.2'],
+  ];
+
+  const COLS = 12, ROWS = 7;          // 字符画的格位（关卡不足 7 行按顶部对齐）
+  const BRICK_W = 46, BRICK_H = 16, BRICK_GAP = 2;
+  const FIELD_LEFT = (640 - COLS * (BRICK_W + BRICK_GAP)) / 2;
+  const FIELD_TOP = 52;
+
+  /** 耐久 → 颜色。用颜色表而不是 if 链，加新耐久值只需加一行。 */
+  const BRICK_COLOR = {
+    1: ['#4cc2ff', '#8fdcff'],
+    2: ['#ff5fa2', '#ffa8cc'],
+    3: ['#ffc857', '#ffe9a8'],
+  };
+
+  /** 把字符画转成砖块数组。越界或非法字符会被忽略，不会生成坏砖。 */
+  function buildLevel(index) {
+    const rows = LEVELS[((index % LEVELS.length) + LEVELS.length) % LEVELS.length];
+    const bricks = [];
+    for (let r = 0; r < rows.length && r < ROWS; r++) {
+      const row = rows[r];
+      for (let c = 0; c < COLS; c++) {
+        const ch = row[c];
+        if (!ch || ch === '.' || ch === ' ') continue;
+        const hp = parseInt(ch, 10);
+        if (!(hp >= 1 && hp <= 3)) continue;
+        bricks.push({
+          x: FIELD_LEFT + c * (BRICK_W + BRICK_GAP),
+          y: FIELD_TOP + r * (BRICK_H + BRICK_GAP),
+          w: BRICK_W, h: BRICK_H,
+          hp, maxHp: hp, alive: true,
+        });
+      }
+    }
+    return bricks;
+  }
+
+  /**
+   * 圆与轴对齐矩形的碰撞。
+   *
+   * 做法：先找矩形上离圆心最近的点，再比距离 —— 比"逐边判定"少一半分支，
+   * 且天然处理了"圆心在矩形内部"这种退化情况（此时按最小穿透轴推出）。
+   * 返回法线方向，调用方据此推出并反射速度。
+   */
+  function circleRect(cx, cy, r, rx, ry, rw, rh) {
+    const nx = Math.max(rx, Math.min(cx, rx + rw));
+    const ny = Math.max(ry, Math.min(cy, ry + rh));
+    let dx = cx - nx, dy = cy - ny;
+    let d2 = dx * dx + dy * dy;
+
+    if (d2 > r * r) return null;
+
+    if (d2 > 1e-9) {
+      const d = Math.sqrt(d2);
+      return { nx: dx / d, ny: dy / d, depth: r - d };
+    }
+
+    // 圆心落在矩形内部：沿最小穿透方向推出
+    const left = cx - rx, right = rx + rw - cx;
+    const top = cy - ry, bottom = ry + rh - cy;
+    const m = Math.min(left, right, top, bottom);
+    if (m === left)  return { nx: -1, ny: 0, depth: left + r };
+    if (m === right) return { nx: 1, ny: 0, depth: right + r };
+    if (m === top)   return { nx: 0, ny: -1, depth: top + r };
+    return { nx: 0, ny: 1, depth: bottom + r };
+  }
+
+  /** 沿法线反射速度：v' = v - 2(v·n)n */
+  function reflect(vx, vy, nx, ny) {
+    const dot = vx * nx + vy * ny;
+    return { vx: vx - 2 * dot * nx, vy: vy - 2 * dot * ny };
+  }
+
+  /**
+   * 挡板反弹：角度由撞击位置决定。
+   *
+   * 纯反射会让球路越打越平（水平分量只减不增），几轮之后变成
+   * "上下弹球"的无聊局面。改成"命中点映射到出射角"之后，
+   * 玩家用挡板边缘就能主动打角度 —— 操作空间是这么来的。
+   * rel ∈ [-1,1] 是命中点相对挡板中心的偏移。
+   */
+  function paddleBounce(cx, paddleCx, halfW, speed, maxAngle) {
+    let rel = (cx - paddleCx) / halfW;
+    rel = Math.max(-1, Math.min(1, rel));
+    const a = rel * maxAngle;
+    return { vx: Math.sin(a) * speed, vy: -Math.cos(a) * speed };
+  }
+
+  /** 球速随破砖数增长，但有上限 —— 无上限会让后期变成随机死亡。 */
+  function speedMultiplier(hits, cap) {
+    return Math.min(cap, 1 + hits * 0.012);
+  }
+
+  /** 归一化到指定速率（换关卡、救球后重置方向时用） */
+  function normalize(vx, vy, speed) {
+    const m = Math.hypot(vx, vy) || 1;
+    return { vx: vx / m * speed, vy: vy / m * speed };
+  }
+
+  return {
+    makeRNG, buildLevel, circleRect, reflect, paddleBounce,
+    speedMultiplier, normalize,
+    LEVELS, COLS, ROWS, BRICK_W, BRICK_H, BRICK_GAP,
+    FIELD_LEFT, FIELD_TOP, BRICK_COLOR,
+  };
+})();
+/* #endregion CORE */
+
+/* ==================================================================
+   游戏层：实体、状态机、渲染、主循环。
+   这一层可以用 CORE，也可以碰 DOM —— 但反过来不行。
+   ================================================================== */
+
+const { makeRNG, buildLevel, circleRect, reflect, paddleBounce,
+        speedMultiplier, normalize, BRICK_COLOR, LEVELS } = CORE;
+
+const W = 640, H = 360;
+const cvs = document.getElementById('world');
+const ctx = cvs.getContext('2d');
+const ui = document.getElementById('ui');
+const stage = document.getElementById('stage');
+
+const $score = document.getElementById('hudScore');
+const $level = document.getElementById('hudLevel');
+const $lives = document.getElementById('hudLives');
+const $ov = document.getElementById('ov');
+const $ovTitle = document.getElementById('ovTitle');
+const $ovBody = document.getElementById('ovBody');
+const $ovHint = document.getElementById('ovHint');
+const $lblScore = document.getElementById('lblScore');
+const $lblLives = document.getElementById('lblLives');
+
+/* ==================================================================
+   语言：两种语言都装在这一个文件里。
+
+   为什么不做成 breakout.en.html：那是两份要各自维护的代码，
+   改一个 bug 得改两遍，迟早不一致。装在同一个文件里，双语共用
+   同一套逻辑，只把文本抽出来 —— 也让测试能断言两种语言的键完全对齐。
+
+   检测顺序：URL 参数 ?lang=en  >  上次手动选择  >  浏览器语言
+   手动切换：按 L
+   ================================================================== */
+const TEXTS = {
+  zh: {
+    'doc.title': '打砖块 · 单文件像素游戏',
+    'hud.score': '分数',
+    'hud.lives': '球',
+    'hud.level': '{n} / {total}',
+    'start.title': '打砖块',
+    'start.body': '移动鼠标或按 ← → 控制挡板。<br>球撞到挡板的位置决定反弹角度 —— 用边缘可以打出斜球。',
+    'start.hint': '按 空格 开始',
+    'over.title': '游戏结束',
+    'over.body': '得分 <span class="keys">{score}</span>　抵达第 {level} 关<br>球用完了。',
+    'over.hint': '按 空格 重新开始',
+    'win.title': '全部通关',
+    'win.body': '得分 <span class="keys">{score}</span><br>五个关卡全部清空。',
+    'win.hint': '按 空格 再来一轮',
+    'clear.title': '第 {level} 关完成',
+    'clear.body': '得分 <span class="keys">{score}</span>　剩余球 {lives}',
+    'clear.hint': '按 空格 进入第 {next} 关',
+  },
+  en: {
+    'doc.title': 'Breakout · Single-file pixel game',
+    'hud.score': 'SCORE',
+    'hud.lives': 'BALLS',
+    'hud.level': '{n} / {total}',
+    'start.title': 'Breakout',
+    'start.body': 'Move with the mouse or ← →. Where the ball strikes the paddle decides the rebound angle — catch it with an edge to send the ball sideways.',
+    'start.hint': 'Press SPACE to start',
+    'over.title': 'Game Over',
+    'over.body': 'Score <span class="keys">{score}</span>　reached level {level}<br>Out of balls.',
+    'over.hint': 'Press SPACE to play again',
+    'win.title': 'All Clear',
+    'win.body': 'Score <span class="keys">{score}</span><br>Every level cleared.',
+    'win.hint': 'Press SPACE for another run',
+    'clear.title': 'Level {level} Clear',
+    'clear.body': 'Score <span class="keys">{score}</span>　balls left {lives}',
+    'clear.hint': 'Press SPACE for level {next}',
+  },
+};
+
+function detectLang() {
+  // 1) URL 参数 —— 最高优先级，方便分享指定语言的链接
+  try {
+    const m = (window.location && window.location.search || '').match(/[?&]lang=(zh|en)\b/);
+    if (m) return m[1];
+  } catch (e) { /* file:// 下访问 location 可能受限 */ }
+
+  // 2) 上次的选择 —— 也要能读得到，否则刷新就跳回浏览器语言
+  try {
+    const saved = window.localStorage.getItem('sfpg.lang');
+    if (saved === 'zh' || saved === 'en') return saved;
+  } catch (e) { /* 隐私模式下会抛异常 */ }
+
+  // 3) 浏览器语言
+  try {
+    const nav = window.navigator || {};
+    const tag = nav.language || (nav.languages && nav.languages[0]) || '';
+    if (tag) return /^zh\b/i.test(tag) ? 'zh' : 'en';
+  } catch (e) { /* 忽略 */ }
+
+  return 'zh';   // 兜底：项目原始语言
+}
+
+let LANG = detectLang();
+
+/** 取文本。params 里的值会替换模板里的 {name} 占位符。 */
+function T(key, params) {
+  const table = TEXTS[LANG] || TEXTS.zh;
+  let s = Object.prototype.hasOwnProperty.call(table, key)
+    ? table[key]
+    : (TEXTS.zh[key] != null ? TEXTS.zh[key] : key);
+  if (params) {
+    s = s.replace(/\{(\w+)\}/g, (whole, name) =>
+      Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : whole);
+  }
+  return s;
+}
+
+/** 把语言同步到 <html lang> 和 <title>。给无障碍工具和搜索引擎看的。 */
+function syncDocLang() {
+  try { document.documentElement.setAttribute('lang', LANG === 'zh' ? 'zh-CN' : 'en'); } catch (e) { /* 忽略 */ }
+  try { document.title = T('doc.title'); } catch (e) { /* 忽略 */ }
+}
+
+function setLang(next) {
+  if (next !== 'zh' && next !== 'en') return;
+  LANG = next;
+  try { window.localStorage.setItem('sfpg.lang', LANG); } catch (e) { /* 降级 */ }
+  syncDocLang();
+  applyLang();
+}
+
+/* ---- 覆盖层：记住"当前该显示哪条文案"，而不是记住渲染好的字符串 ----
+   这样按 L 切语言时可以直接重绘，不需要每个调用点各写一遍刷新逻辑。
+
+   注意：**必须一开始就设好 overlayKeys**。放开局画面时它是 null 的话，
+   paintOverlay 会直接返回，于是"开局时按 L 切换语言"对开始界面毫无效果 ——
+   而其余场景（结算、通关）却是正常的，这种"只在某一屏失效"最难查。
+   所以初始值就是开始界面的三个键。 */
+let overlayKeys = { titleKey: 'start.title', bodyKey: 'start.body', hintKey: 'start.hint', params: null };
+
+function showOverlay(titleKey, bodyKey, hintKey, params) {
+  overlayKeys = { titleKey, bodyKey, hintKey, params: params || null };
+  paintOverlay();
+  $ov.classList.add('on');
+}
+
+function paintOverlay() {
+  if (!overlayKeys) return;
+  const { titleKey, bodyKey, hintKey, params } = overlayKeys;
+  $ovTitle.textContent = T(titleKey, params);
+  if (bodyKey) $ovBody.innerHTML = T(bodyKey, params);
+  $ovHint.textContent = T(hintKey, params);
+}
+
+/** 切换语言时刷新静态文本；动态数值由 syncHud 负责 */
+function applyLang() {
+  $lblScore.textContent = T('hud.score');
+  $lblLives.textContent = T('hud.lives');
+  paintOverlay();
+  syncHud(true);      // 强制重写：等级栏的格式可能随语言变化
+}
+
+/* ---- 调参区：手感相关的数字都集中在这里，改这里就够了 ---- */
+const PADDLE_W = 84, PADDLE_H = 10, PADDLE_Y = 332;
+const PADDLE_SPEED = 460;            // 键盘移动速度 px/s
+const PADDLE_ACCEL = 1 - Math.exp(-19 * 0.016);  // 平滑系数（下面按帧算）
+const BALL_R = 4;
+const BASE_SPEED = 214;
+const SPEED_CAP = 1.72;
+const MAX_BOUNCE_ANGLE = 1.09;       // 约 62°
+const MAX_SUBSTEP = 2;               // 每步最大位移，防穿模
+const START_LIVES = 3;
+const DROP_CHANCE = 0.14;            // 破砖掉道具的概率
+const EFFECT_MS = 11000;             // 道具持续时长
+
+/* ---- 运行状态 ---- */
+const G = {
+  state: 'start',      // start | ready | play | clear | over | win
+  level: 0,
+  score: 0,
+  lives: START_LIVES,
+  hits: 0,             // 累计破砖数，用于球速曲线
+  paddle: { x: W / 2 - PADDLE_W / 2, w: PADDLE_W, targetX: W / 2 - PADDLE_W / 2 },
+  balls: [],
+  bricks: [],
+  drops: [],
+  particles: [],
+  effects: { wide: 0, slow: 0 },   // 剩余毫秒
+  rng: makeRNG(20261015),
+  shake: 0,
+  flash: 0,
+};
+
+/* ---- 音效：环境不支持时必须静默降级，绝不能因此崩掉 ----
+   注意 typeof 检查 —— 测试环境里没有 AudioContext，
+   直接 new 会抛异常，那样整个游戏会在第一步就死。 */
+let actx = null;
+function sfx(freq, dur, type, gain) {
+  try {
+    if (typeof AudioContext === 'undefined' && typeof webkitAudioContext === 'undefined') return;
+    if (!actx) actx = new (typeof AudioContext !== 'undefined' ? AudioContext : webkitAudioContext)();
+    if (actx.state === 'suspended' && actx.resume) actx.resume();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'square';
+    o.frequency.value = freq;
+    g.gain.value = gain == null ? 0.035 : gain;
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch (e) { /* 静默降级：没声音也不能没游戏 */ }
+}
+
+/* ---- 双缓冲式的缩放：canvas 用 CSS 尺寸整数倍，DOM 用 transform ----
+   这里是刻意不写成裸 innerWidth 的：值型全局必须挂在 window 上读，
+   否则测试环境里注入的会是一个被定格在启动瞬间的旧值。 */
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const s = Math.max(1, Math.floor(Math.min(vw / W, vh / H)));
+  cvs.style.width = (W * s) + 'px';
+  cvs.style.height = (H * s) + 'px';
+  ui.style.transform = 'scale(' + s + ')';
+  stage.style.left = Math.round((vw - W * s) / 2) + 'px';
+  stage.style.top = Math.round((vh - H * s) / 2) + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+/* ---- 状态切换 ---- */
+function hideOverlay() { $ov.classList.remove('on'); }
+
+function startRun() {
+  G.level = 0; G.score = 0; G.lives = START_LIVES; G.hits = 0;
+  G.effects.wide = 0; G.effects.slow = 0;
+  G.drops.length = 0; G.particles.length = 0;
+  loadLevel();
+}
+
+function loadLevel() {
+  G.bricks = buildLevel(G.level);
+  G.paddle.w = PADDLE_W;
+  G.paddle.x = W / 2 - PADDLE_W / 2;
+  G.paddle.targetX = G.paddle.x;
+  G.drops.length = 0;
+  G.balls.length = 0;
+  resetBall();
+  G.state = 'ready';
+  hideOverlay();
+  syncHud();
+}
+
+/** 球回到挡板上待发。这是"准备就绪"状态，按空格才飞出去。 */
+function resetBall() {
+  G.balls.length = 0;
+  G.balls.push({
+    x: G.paddle.x + G.paddle.w / 2,
+    y: PADDLE_Y - BALL_R - 1,
+    vx: 0, vy: 0, r: BALL_R, stuck: true,
+  });
+}
+
+function launch() {
+  if (G.state !== 'ready') return;
+  const b = G.balls[0];
+  if (!b) return;
+  b.stuck = false;
+  const sp = BASE_SPEED;
+  // 略微偏离垂直，避免开局就陷入竖直往返
+  const a = (G.rng() - 0.5) * 0.7;
+  b.vx = Math.sin(a) * sp;
+  b.vy = -Math.cos(a) * sp;
+  G.state = 'play';
+  sfx(520, 0.07, 'square');
+}
+
+/* ---- 道具 ---- */
+const DROPS = {
+  wide: { color: '#8ef0c8', label: 'W' },
+  multi: { color: '#ffc857', label: 'M' },
+  slow: { color: '#4cc2ff', label: 'S' },
+};
+
+function spawnDrop(x, y) {
+  const roll = G.rng();
+  if (roll > DROP_CHANCE) return;
+  const keys = Object.keys(DROPS);
+  const kind = keys[Math.floor(G.rng() * keys.length) % keys.length];
+  G.drops.push({ x, y, vy: 92, kind, w: 16, h: 10 });
+}
+
+function applyDrop(kind) {
+  if (kind === 'wide') { G.effects.wide = EFFECT_MS; G.paddle.w = Math.round(PADDLE_W * 1.6); }
+  else if (kind === 'slow') { G.effects.slow = EFFECT_MS; }
+  else if (kind === 'multi') {
+    // 复制现有球，各偏一个角度 —— 多球不该让总速度变快
+    const src = G.balls.slice(0, 3);
+    for (const b of src) {
+      if (b.stuck) continue;
+      const sp = Math.hypot(b.vx, b.vy) || BASE_SPEED;
+      for (const off of [-0.42, 0.42]) {
+        const a = Math.atan2(b.vy, b.vx) + off;
+        G.balls.push({ x: b.x, y: b.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+                       r: BALL_R, stuck: false });
+      }
+    }
+  }
+  sfx(880, 0.09, 'triangle', 0.05);
+}
+
+/* ---- 粒子 ---- */
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = G.rng() * Math.PI * 2;
+    const s = 40 + G.rng() * 120;
+    G.particles.push({
+      x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 30,
+      life: 320 + G.rng() * 220, max: 540, color,
+    });
+  }
+}
+
+/* ---- 更新 ---- */
+function update(dt) {
+  const ms = dt * 1000;
+
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 2.2);
+  if (G.flash > 0) G.flash = Math.max(0, G.flash - dt * 3.4);
+
+  // 道具计时：到点就把效果收回去
+  for (const k of Object.keys(G.effects)) {
+    if (G.effects[k] > 0) {
+      G.effects[k] -= ms;
+      if (G.effects[k] <= 0) {
+        G.effects[k] = 0;
+        if (k === 'wide') G.paddle.w = PADDLE_W;
+      }
+    }
+  }
+
+  // 挡板：键盘和鼠标都写进同一个 targetX，再由同一条平滑逻辑逼近。
+  // 两套输入各写各的位置会出现"鼠标一停键盘就失效"的打架现象。
+  if (Input.left)  G.paddle.targetX -= PADDLE_SPEED * dt;
+  if (Input.right) G.paddle.targetX += PADDLE_SPEED * dt;
+  G.paddle.targetX = Math.max(0, Math.min(W - G.paddle.w, G.paddle.targetX));
+  const k = 1 - Math.exp(-22 * dt);
+  G.paddle.x += (G.paddle.targetX - G.paddle.x) * k;
+  G.paddle.x = Math.max(0, Math.min(W - G.paddle.w, G.paddle.x));
+
+  if (G.state === 'ready') {
+    const b = G.balls[0];
+    if (b) { b.x = G.paddle.x + G.paddle.w / 2; b.y = PADDLE_Y - b.r - 1; }
+  }
+
+  if (G.state === 'play') {
+    const speedMul = speedMultiplier(G.hits, SPEED_CAP) * (G.effects.slow > 0 ? 0.72 : 1);
+    for (const b of G.balls) moveBall(b, dt, speedMul);
+    // 掉出底部的球移除；全没了就扣命
+    prune(G.balls, b => b.y - b.r > H + 20);
+    if (G.balls.length === 0) loseLife();
+  }
+
+  /* 关卡清空判定独立于球的状态。
+     "砖块打完了"和"球还在不在场上"是两件事，原先放在同一个 if 里，
+     意味着球飞出去的那一刻会跳过清关判定。实战里很难撞上（最后一块砖
+     被击碎的那一帧就会清关），但它让"清空"这个条件依赖执行顺序 ——
+     调试接口清空砖块时就暴露了：状态停在 ready，关卡永远不结束。 */
+  if (G.bricks.length && G.bricks.every(b => !b.alive) &&
+      (G.state === 'play' || G.state === 'ready')) {
+    clearLevel();
+  }
+
+  // 道具下落
+  for (const d of G.drops) d.y += d.vy * dt;
+  for (const d of G.drops) {
+    if (G.state !== 'play' && G.state !== 'ready') continue;
+    if (d.y + d.h > PADDLE_Y && d.y < PADDLE_Y + PADDLE_H &&
+        d.x + d.w > G.paddle.x && d.x < G.paddle.x + G.paddle.w) {
+      applyDrop(d.kind);
+      d.dead = true;
+    }
+    if (d.y > H + 20) d.dead = true;
+  }
+  prune(G.drops, d => d.dead);
+
+  // 粒子
+  for (const p of G.particles) {
+    p.life -= ms;
+    p.vy += 340 * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    if (p.life <= 0) p.dead = true;
+  }
+  prune(G.particles, p => p.dead);
+}
+
+/** 原地压缩：比 filter 少一次分配，在每帧都要跑的地方值得这么写 */
+function prune(arr, isDead) {
+  let n = 0;
+  for (let i = 0; i < arr.length; i++) if (!isDead(arr[i])) arr[n++] = arr[i];
+  arr.length = n;
+}
+
+/**
+ * 球的移动。
+ *
+ * 关键是把一帧的位移拆成不超过 MAX_SUBSTEP 像素的小段再逐步判定 ——
+ * 球速到 400px/s 时一帧就走出 6~7 像素，如果只在帧末判一次，
+ * 薄墙（砖高 16、挡板高 10）会被直接穿过去。这类"偶尔穿模"的
+ * 缺陷最难查，因为它依赖具体的帧时长和球速组合。
+ */
+function moveBall(b, dt, speedMul) {
+  const sp = Math.hypot(b.vx, b.vy);
+  if (sp < 1e-6) return;
+  const target = BASE_SPEED * speedMul;
+  const norm = normalize(b.vx, b.vy, target);
+  b.vx = norm.vx; b.vy = norm.vy;
+
+  const total = Math.hypot(b.vx, b.vy) * dt;
+  const steps = Math.max(1, Math.ceil(total / MAX_SUBSTEP));
+  const sdt = dt / steps;
+
+  for (let i = 0; i < steps; i++) {
+    b.x += b.vx * sdt;
+    b.y += b.vy * sdt;
+
+    // 墙壁
+    if (b.x - b.r < 0)     { b.x = b.r;     const r = reflect(b.vx, b.vy, 1, 0);  b.vx = r.vx; b.vy = r.vy; }
+    if (b.x + b.r > W)     { b.x = W - b.r; const r = reflect(b.vx, b.vy, -1, 0); b.vx = r.vx; b.vy = r.vy; }
+    if (b.y - b.r < 0)     { b.y = b.r;     const r = reflect(b.vx, b.vy, 0, 1);  b.vx = r.vx; b.vy = r.vy; }
+
+    // 挡板：用角度映射而不是纯反射（见 CORE.paddleBounce）
+    const hitP = circleRect(b.x, b.y, b.r, G.paddle.x, PADDLE_Y, G.paddle.w, PADDLE_H);
+    if (hitP && b.vy > 0) {
+      b.y = PADDLE_Y - b.r - 0.01;
+      const sp2 = Math.hypot(b.vx, b.vy);
+      const out = paddleBounce(b.x, G.paddle.x + G.paddle.w / 2, G.paddle.w / 2, sp2, MAX_BOUNCE_ANGLE);
+      b.vx = out.vx; b.vy = out.vy;
+      sfx(300, 0.05, 'square', 0.03);
+    }
+
+    // 砖块：每小步最多处理一次命中，取最近的那块
+    let best = null, bestD = Infinity;
+    for (const k of G.bricks) {
+      if (!k.alive) continue;
+      const h = circleRect(b.x, b.y, b.r, k.x, k.y, k.w, k.h);
+      if (h && h.depth < bestD) { bestD = h.depth; best = { brick: k, hit: h }; }
+    }
+    if (best) {
+      // 沿法线把球推到接触面外侧，避免下一小步重复命中同一块
+      b.x += best.hit.nx * (best.hit.depth + 0.01);
+      b.y += best.hit.ny * (best.hit.depth + 0.01);
+      const r = reflect(b.vx, b.vy, best.hit.nx, best.hit.ny);
+      b.vx = r.vx; b.vy = r.vy;
+      damageBrick(best.brick);
+    }
+  }
+}
+
+function damageBrick(k) {
+  k.hp -= 1;
+  const colors = BRICK_COLOR[k.maxHp] || BRICK_COLOR[1];
+  if (k.hp <= 0) {
+    k.alive = false;
+    G.hits++;
+    const gain = 10 * Math.max(1, k.maxHp);
+    G.score += gain;
+    burst(k.x + k.w / 2, k.y + k.h / 2, colors[0], 8);
+    spawnDrop(k.x + k.w / 2 - 8, k.y + k.h / 2);
+    G.shake = Math.min(0.5, G.shake + 0.16);
+    sfx(660 + k.maxHp * 110, 0.055, 'square', 0.028);
+    syncHud();
+  } else {
+    burst(k.x + k.w / 2, k.y + k.h / 2, colors[1], 3);
+    sfx(300 + k.hp * 90, 0.04, 'square', 0.022);
+  }
+}
+
+function loseLife() {
+  G.lives--;
+  G.shake = 0.85;
+  G.flash = 1;
+  sfx(150, 0.28, 'sawtooth', 0.05);
+  syncHud();
+  if (G.lives <= 0) {
+    G.state = 'over';
+    showOverlay('over.title', 'over.body', 'over.hint',
+                { score: G.score, level: G.level + 1 });
+  } else {
+    G.effects.wide = 0; G.effects.slow = 0;
+    G.paddle.w = PADDLE_W;
+    G.drops.length = 0;
+    resetBall();
+    G.state = 'ready';
+  }
+}
+
+function clearLevel() {
+  G.level++;
+  if (G.level >= LEVELS.length) {
+    G.state = 'win';
+    showOverlay('win.title', 'win.body', 'win.hint', { score: G.score });
+    return;
+  }
+  G.state = 'clear';
+  showOverlay('clear.title', 'clear.body', 'clear.hint',
+              { level: G.level, score: G.score, lives: G.lives, next: G.level + 1 });
+}
+
+/* ---- HUD：只在值真的变了才写 DOM ---- */
+const hudCache = {};
+function setText(el, key, value, force) {
+  if (!force && hudCache[key] === value) return;
+  hudCache[key] = value;
+  el.textContent = value;
+}
+function syncHud(force) {
+  setText($score, 'score', String(G.score), force);
+  setText($level, 'level', T('hud.level', { n: G.level + 1, total: LEVELS.length }), force);
+  setText($lives, 'lives', G.lives > 0 ? '♥'.repeat(G.lives) : '—', force);
+}
+
+/* ---- 渲染 ---- */
+function render() {
+  ctx.save();
+  if (G.shake > 0) {
+    const t = G.shake * G.shake * 11;
+    ctx.translate((G.rng() - 0.5) * t, (G.rng() - 0.5) * t);
+  }
+
+  ctx.fillStyle = '#0b0e14';
+  ctx.fillRect(-16, -16, W + 32, H + 32);
+
+  // 细网格背景，给像素画面一点纵深
+  ctx.fillStyle = 'rgba(255,255,255,0.022)';
+  for (let x = 0; x < W; x += 32) ctx.fillRect(x, 0, 1, H);
+  for (let y = 0; y < H; y += 32) ctx.fillRect(0, y, W, 1);
+
+  // 砖块
+  for (const k of G.bricks) {
+    if (!k.alive) continue;
+    const colors = BRICK_COLOR[k.maxHp] || BRICK_COLOR[1];
+    ctx.fillStyle = colors[0];
+    ctx.fillRect(k.x, k.y, k.w, k.h);
+    ctx.fillStyle = colors[1];
+    ctx.fillRect(k.x, k.y, k.w, 3);                 // 顶部高光，像素画常见做法
+    if (k.hp < k.maxHp) {
+      ctx.fillStyle = 'rgba(0,0,0,0.34)';           // 受损显示：叠一层暗
+      ctx.fillRect(k.x, k.y, k.w, k.h);
+      ctx.fillStyle = colors[1];
+      ctx.fillRect(k.x, k.y, k.w, 2);
+    }
+  }
+
+  // 道具
+  for (const d of G.drops) {
+    const info = DROPS[d.kind];
+    ctx.fillStyle = info.color;
+    ctx.fillRect(d.x, d.y, d.w, d.h);
+    ctx.fillStyle = '#0b0e14';
+    ctx.fillRect(d.x + 3, d.y + 2, d.w - 6, 2);
+    ctx.fillRect(d.x + 3, d.y + d.h - 4, d.w - 6, 2);
+  }
+
+  // 挡板
+  ctx.fillStyle = G.effects.wide > 0 ? '#8ef0c8' : '#e8eef7';
+  ctx.fillRect(G.paddle.x, PADDLE_Y, G.paddle.w, PADDLE_H);
+  ctx.fillStyle = 'rgba(255,255,255,0.45)';
+  ctx.fillRect(G.paddle.x, PADDLE_Y, G.paddle.w, 2);
+
+  // 球（画方不画圆：低分辨率下方形更像像素画）
+  ctx.fillStyle = '#ffc857';
+  for (const b of G.balls) ctx.fillRect(b.x - b.r, b.y - b.r, b.r * 2, b.r * 2);
+
+  // 粒子
+  for (const p of G.particles) {
+    const a = Math.max(0, Math.min(1, p.life / p.max));
+    ctx.globalAlpha = a;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+  }
+  ctx.globalAlpha = 1;
+
+  // 道具生效时给个边框提示，让玩家知道还剩多久
+  if (G.effects.wide > 0 || G.effects.slow > 0) {
+    const left = Math.max(G.effects.wide, G.effects.slow) / EFFECT_MS;
+    ctx.fillStyle = 'rgba(142,240,200,0.5)';
+    ctx.fillRect(0, H - 3, W * left, 3);
+  }
+
+  if (G.flash > 0) {
+    ctx.fillStyle = 'rgba(255,60,90,' + (G.flash * 0.28) + ')';
+    ctx.fillRect(-16, -16, W + 32, H + 32);
+  }
+  ctx.restore();
+}
+
+/* ---- 输入 ---- */
+const Input = { left: false, right: false };
+
+addEventListener('keydown', e => {
+  const k = e.key;
+  // 双语：L 键随时切换，切换后立刻重绘界面（不打断当前对局）
+  if (k === 'l' || k === 'L') { setLang(LANG === 'zh' ? 'en' : 'zh'); return; }
+  if (k === 'ArrowLeft' || k === 'a' || k === 'A') Input.left = true;
+  if (k === 'ArrowRight' || k === 'd' || k === 'D') Input.right = true;
+  if (k === ' ' || k === 'Enter') {
+    e.preventDefault();
+    if (G.state === 'start') { startRun(); }
+    else if (G.state === 'ready') { launch(); }
+    else if (G.state === 'clear') { loadLevel(); }
+    else if (G.state === 'over' || G.state === 'win') {
+      G.state = 'start'; startRun();
+    }
+  }
+});
+addEventListener('keyup', e => {
+  const k = e.key;
+  if (k === 'ArrowLeft' || k === 'a' || k === 'A') Input.left = false;
+  if (k === 'ArrowRight' || k === 'd' || k === 'D') Input.right = false;
+});
+// 鼠标移动同步到 targetX；键盘和鼠标共用同一个目标值，不会互相打架
+cvs.addEventListener('mousemove', e => {
+  const r = cvs.getBoundingClientRect();
+  const scale = r.width / W;
+  const mx = (e.clientX - r.left) / scale;
+  G.paddle.targetX = Math.max(0, Math.min(W - G.paddle.w, mx - G.paddle.w / 2));
+});
+cvs.addEventListener('mousedown', () => {
+  if (G.state === 'ready') launch();
+  else if (G.state === 'start') startRun();
+  else if (G.state === 'clear') loadLevel();
+  else if (G.state === 'over' || G.state === 'win') { G.state = 'start'; startRun(); }
+});
+
+/* ---- 主循环：固定步长 + 累加器 ----
+   固定步长让物理表现与帧率无关；累加器上限防止切回标签页时
+   一帧内狂奔几百步（那会让球瞬移穿墙）。 */
+const STEP = 1 / 120;
+let acc = 0, last = 0;
+
+function frame(now) {
+  if (!last) last = now;
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  let steps = 0;
+  while (acc >= STEP && steps < 12) { update(STEP); acc -= STEP; steps++; }
+  if (steps === 12) acc = 0;
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ---- 调试接口 ----
+   三种用途：自动化测试的确定性驱动入口、控制台里手动调参、
+   以及自己排查问题时不必反复重开。 */
+window.__GAME__ = {
+  state: () => G.state,
+  setState: s => { G.state = s; },
+  level: () => G.level,
+  score: () => G.score,
+  lives: () => G.lives,
+  hits: () => G.hits,
+  paddle: () => G.paddle,
+  balls: () => G.balls,
+  bricks: () => G.bricks,
+  drops: () => G.drops,
+  particles: () => G.particles,
+  effects: () => G.effects,
+  aliveBricks: () => G.bricks.filter(k => k.alive).length,
+  setSeed: n => { G.rng = makeRNG(n); },
+  start: () => { G.state = 'start'; startRun(); },
+  launch,
+  levelIndex: n => { G.level = Math.max(0, Math.min(LEVELS.length - 1, n)); loadLevel(); },
+  /** 把球放到指定位置并给定速度，用于确定性地构造碰撞场景 */
+  placeBall: (i, x, y, vx, vy) => {
+    const b = G.balls[i];
+    if (!b) return null;
+    b.x = x; b.y = y; b.vx = vx; b.vy = vy; b.stuck = false;
+    return b;
+  },
+  destroyAllBricks: () => {
+    for (const k of G.bricks) if (k.alive) { k.alive = false; G.hits++; G.score += 10; }
+    syncHud();
+  },
+  movePaddleTo: x => { G.paddle.targetX = x; G.paddle.x = x; },
+  syncHud,
+  /* ---- 双语 ---- */
+  lang: () => LANG,
+  setLang,
+  t: (key, params) => T(key, params),
+  textKeys: () => Object.keys(TEXTS.zh),
+  overlayKeys: () => (overlayKeys ? { ...overlayKeys } : null),
+};
+
+/* 启动：先把语言应用到静态文本上，再同步 HUD。
+   顺序不能反 —— applyLang 会强制重写 HUD，先 syncHud 只是白做一次。 */
+syncDocLang();
+applyLang();
+</script>
+</body>
+</html>

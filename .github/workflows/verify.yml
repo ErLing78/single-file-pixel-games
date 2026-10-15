@@ -1,0 +1,92 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ["18", "20", "22"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Confirm there is nothing to install
+        shell: bash
+        run: |
+          node --version
+          test ! -d node_modules && echo "no node_modules"
+          test ! -f package-lock.json && echo "no lockfile"
+          echo "zero-dependency guarantee holds"
+
+      - name: Algorithm unit tests
+        run: node tests/core.test.mjs
+
+      - name: End-to-end smoke tests
+        run: node tests/smoke.test.mjs
+
+      - name: Rules and balance tests
+        run: node tests/systems.test.mjs
+
+      - name: Static consistency checks
+        run: node tests/dom-check.mjs
+
+      - name: Documentation matches reality
+        # Runs the four suites again and asserts every number in README.md
+        # and index.html is still correct.
+        run: node tests/readme.test.mjs
+
+  offline:
+    name: Games run with no network
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Every game file must be self-contained
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          bad = []
+          for p in sorted(pathlib.Path('games').glob('*.html')) + [pathlib.Path('index.html')]:
+              text = p.read_text(encoding='utf-8')
+              hits = []
+              if re.search(r'<script[^>]+\bsrc\s*=', text, re.I): hits.append('script src')
+              if re.search(r'<link[^>]+\bhref\s*=\s*["\']?(?!#)[^"\'>]+', text, re.I): hits.append('link href')
+              if re.search(r'\b(?:src|href)\s*=\s*["\'](?:https?:)?//', text, re.I): hits.append('absolute URL')
+              if re.search(r'@import\s', text): hits.append('CSS @import')
+              if re.search(r'\bfetch\s*\(', text): hits.append('fetch()')
+              if hits:
+                  bad.append(f'{p}: {", ".join(hits)}')
+          for b in bad: print('PROBLEM:', b)
+          print('checked every game file has no external references' if not bad else 'FAILED')
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Each game is a single file under 48 KB
+        shell: bash
+        run: |
+          # Bilingual text roughly doubles the string payload, so the ceiling
+          # moved from 40 KB to 48 KB. The point of the check is to stop a game
+          # from quietly becoming a project; 48 KB still leaves plenty of room.
+          for f in games/*.html; do
+            size=$(wc -c < "$f")
+            echo "$f  $size bytes"
+            if [ "$size" -gt 49152 ]; then echo "too large: $f"; exit 1; fi
+          done
+          echo "all games are small single files"

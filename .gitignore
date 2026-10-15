@@ -1,0 +1,20 @@
+# 测试产物
+tests/.solutions.json
+
+# Node（本项目不需要任何依赖，出现这些说明有人误装了什么）
+node_modules/
+package-lock.json
+npm-debug.log*
+yarn.lock
+pnpm-lock.yaml
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini

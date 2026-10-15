@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>单文件像素游戏模板集 · 五个能读、能玩、能改的小游戏</title>
+<style>
+  :root{
+    --bg:#07090e; --panel:#0e131c; --line:#1e2734;
+    --ink:#e8eef7; --dim:#8290a4; --faint:#5a6577;
+    --a:#4cc2ff; --b:#6ee7a8; --c:#ffc857; --d:#ff6b81; --e:#c084fc;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg);color:var(--ink);
+    font:15px/1.7 ui-sans-serif,system-ui,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+    padding:56px 24px 72px;
+  }
+  .wrap{max-width:1000px;margin:0 auto}
+
+  header{margin-bottom:44px}
+  h1{font-size:30px;font-weight:600;letter-spacing:.01em;line-height:1.35}
+  h1 .accent{color:var(--b)}
+  .lede{color:var(--dim);margin-top:14px;max-width:660px;font-size:15px}
+  .lede code{
+    font:13px/1.5 ui-monospace,"Cascadia Mono",Consolas,monospace;
+    background:#ffffff0d;padding:1px 6px;border-radius:4px;color:var(--b);
+  }
+  .meta{margin-top:18px;display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--faint)}
+  .meta span{display:flex;align-items:center;gap:6px}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--b)}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(288px,1fr));gap:16px}
+  .card{
+    display:block;text-decoration:none;color:inherit;
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:20px;transition:border-color .15s,transform .15s,background .15s;
+  }
+  .card:hover{border-color:#2f3d52;transform:translateY(-2px);background:#111826}
+  .card-top{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+  .icon{
+    width:40px;height:40px;border-radius:9px;flex:none;
+    display:flex;align-items:center;justify-content:center;
+    background:#ffffff0a;
+  }
+  .card h2{font-size:17px;font-weight:600}
+  .card .teach{font-size:12px;color:var(--faint);margin-top:2px}
+  .card p{font-size:13.5px;color:var(--dim);line-height:1.65}
+  .card .keys{
+    margin-top:14px;padding-top:12px;border-top:1px solid var(--line);
+    font:12px/1.6 ui-monospace,"Cascadia Mono",Consolas,monospace;color:var(--faint);
+  }
+  .card .keys b{color:var(--dim);font-weight:400}
+
+  section.how{margin-top:52px}
+  section.how h3{font-size:17px;font-weight:600;margin-bottom:16px}
+  pre{
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:16px 18px;overflow-x:auto;
+    font:13px/1.75 ui-monospace,"Cascadia Mono",Consolas,monospace;color:var(--dim);
+  }
+  pre .cmt{color:var(--faint)}
+  pre .ok{color:var(--b)}
+  .cols{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:20px;margin-top:16px}
+  .cols div p{font-size:13.5px;color:var(--dim);margin-top:6px}
+  .cols h4{font-size:14px;font-weight:600;color:var(--ink)}
+  .cols a{color:var(--a);text-decoration:none}
+  .cols a:hover{text-decoration:underline}
+
+  footer{margin-top:56px;padding-top:22px;border-top:1px solid var(--line);
+         font-size:13px;color:var(--faint);display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  footer a{color:var(--dim);text-decoration:none}
+  footer a:hover{color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>五个像素游戏，<span class="accent">每个都是一个 HTML 文件</span></h1>
+    <p class="lede">
+      没有构建步骤、没有 npm、没有 CDN —— 双击就能玩，另存就能改。界面中英双语，按 <b>L</b> 切换。
+      每个文件内部按 <code>算法区</code> / <code>游戏层</code> 分层，算法区不碰 DOM，
+      所以能被单独抠出来做单元测试。五个游戏合起来有 <b>850 条自动化断言</b> 在跑。
+    </p>
+    <div class="meta">
+      <span><i class="dot"></i>零依赖 · 完全离线</span>
+      <span><i class="dot"></i>640×360 像素画布</span>
+      <span><i class="dot"></i>中英双语界面</span>
+      <span><i class="dot"></i>MIT 许可</span>
+    </div>
+  </header>
+
+  <div class="grid">
+
+    <a class="card" href="games/breakout.html">
+      <div class="card-top">
+        <div class="icon">
+          <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+            <rect x="2" y="3" width="6" height="3" fill="#4cc2ff"/>
+            <rect x="10" y="3" width="6" height="3" fill="#ff5fa2"/>
+            <rect x="18" y="3" width="6" height="3" fill="#ffc857"/>
+            <rect x="2" y="8" width="6" height="3" fill="#ffc857"/>
+            <rect x="10" y="8" width="6" height="3" fill="#4cc2ff"/>
+            <rect x="18" y="8" width="6" height="3" fill="#ff5fa2"/>
+            <rect x="11" y="16" width="4" height="4" fill="#ffc857"/>
+            <rect x="6" y="22" width="14" height="3" fill="#e8eef7"/>
+          </svg>
+        </div>
+        <div>
+          <h2>打砖块</h2>
+          <div class="teach">碰撞检测与关卡数据驱动</div>
+        </div>
+      </div>
+      <p>球撞挡板的位置决定反弹角度。5 个关卡用字符画描述 —— 加一关就是多打几行字，不用碰任何逻辑。</p>
+      <div class="keys"><b>操作</b>　← → 或鼠标移动挡板　空格 发射</div>
+    </a>
+
+    <a class="card" href="games/snake.html">
+      <div class="card-top">
+        <div class="icon">
+          <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+            <rect x="14" y="4" width="4" height="4" fill="#c6ffe0"/>
+            <rect x="10" y="8" width="4" height="4" fill="#6ee7a8"/>
+            <rect x="6" y="12" width="4" height="4" fill="#6ee7a8"/>
+            <rect x="6" y="16" width="4" height="4" fill="#6ee7a8"/>
+            <rect x="14" y="18" width="4" height="4" fill="#ff6b81"/>
+          </svg>
+        </div>
+        <div>
+          <h2>贪吃蛇</h2>
+          <div class="teach">网格逻辑与转向缓冲</div>
+        </div>
+      </div>
+      <p>"推进一格"写成纯函数。转向可以排队两拍 —— 这一个小设计，决定了快速连按会不会丢输入。</p>
+      <div class="keys"><b>操作</b>　方向键 / WASD　空格 暂停　R 重开</div>
+    </a>
+
+    <a class="card" href="games/platformer.html">
+      <div class="card-top">
+        <div class="icon">
+          <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+            <rect x="3" y="20" width="20" height="4" fill="#2f3a4d"/>
+            <rect x="3" y="14" width="9" height="3" fill="#6ee7a8"/>
+            <rect x="15" y="9" width="8" height="3" fill="#6ee7a8"/>
+            <rect x="11" y="12" width="5" height="6" fill="#ffd166"/>
+            <rect x="18" y="3" width="4" height="4" fill="#ffc857"/>
+          </svg>
+        </div>
+        <div>
+          <h2>平台跳跃</h2>
+          <div class="teach">瓦片碰撞与手感参数</div>
+        </div>
+      </div>
+      <p>轴分离碰撞、单向平台、土狼时间、跳跃缓冲、变高跳。手感靠的是时间，不是粒子特效。</p>
+      <div class="keys"><b>操作</b>　← → / AD　空格 跳（长按更高）　R 重来</div>
+    </a>
+
+    <a class="card" href="games/sokoban.html">
+      <div class="card-top">
+        <div class="icon">
+          <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+            <rect x="3" y="3" width="20" height="20" fill="none" stroke="#39435a" stroke-width="2"/>
+            <rect x="8" y="8" width="6" height="6" fill="#c9852f"/>
+            <rect x="15" y="15" width="5" height="5" fill="#c9852f"/>
+            <rect x="6" y="16" width="5" height="5" fill="#ffc857"/>
+            <rect x="16" y="6" width="4" height="4" fill="#4cc2ff"/>
+          </svg>
+        </div>
+        <div>
+          <h2>推箱子</h2>
+          <div class="teach">不可变状态与撤销栈</div>
+        </div>
+      </div>
+      <p>移动写成"进去一个状态、出来一个新状态"，撤销、求解器、回放全都免费得到。6 个关卡都被 BFS 证明过可解。</p>
+      <div class="keys"><b>操作</b>　方向键 / WASD　Z 撤销　R 重来</div>
+    </a>
+
+    <a class="card" href="games/shooter.html">
+      <div class="card-top">
+        <div class="icon">
+          <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+            <circle cx="13" cy="7" r="4" fill="#ff6b81"/>
+            <circle cx="5" cy="13" r="2.5" fill="#ffb3bd"/>
+            <circle cx="21" cy="16" r="2.5" fill="#ffd166"/>
+            <rect x="12" y="10" width="2" height="5" fill="#a8f0d0"/>
+            <path d="M13 17 L18 24 L13 22 L8 24 Z" fill="#6ee7a8"/>
+          </svg>
+        </div>
+        <div>
+          <h2>弹幕射击</h2>
+          <div class="teach">实体系统与弹幕模式</div>
+        </div>
+      </div>
+      <p>弹幕是数据不是代码：每种形状都是一个返回速度向量数组的纯函数。三种敌人三种弹幕，形状两两不同。</p>
+      <div class="keys"><b>操作</b>　← → / AD　按住空格 开火</div>
+    </a>
+
+  </div>
+
+  <section class="how">
+    <h3>怎么跑</h3>
+    <p style="color:var(--dim);font-size:14px;margin-bottom:14px">
+      直接双击任意 <code style="color:var(--b)">games/*.html</code> 即可。要让五个游戏在同一站点里互相跳转，用任意静态服务器：
+    </p>
+    <pre><span class="cmt"># 任选一种，都不需要装任何东西</span>
+python -m http.server 8000
+npx serve .
+
+<span class="cmt"># 然后打开 http://localhost:8000</span></pre>
+
+    <h3 style="margin-top:34px">怎么验证</h3>
+    <pre>node tests/core.test.mjs      <span class="cmt"># 算法单元测试（196 项）</span>
+node tests/smoke.test.mjs     <span class="cmt"># 端到端冒烟测试（158 项）</span>
+node tests/systems.test.mjs   <span class="cmt"># 规则与平衡测试（256 项）</span>
+node tests/dom-check.mjs      <span class="cmt"># 静态一致性检查（240 项）</span>
+node tests/readme.test.mjs    <span class="cmt"># 文档一致性检查（不计入上面的总数）</span>
+
+npm test                      <span class="cmt"># 一次跑完</span>
+<span class="ok">→ 850 项全部通过</span></pre>
+    <p style="color:var(--faint);font-size:13px;margin-top:12px">
+      不需要 npm install —— 测试只用 Node 内置模块。
+    </p>
+  </section>
+
+  <section class="how">
+    <h3>怎么改</h3>
+    <div class="cols">
+      <div>
+        <h4><a href="docs/ANATOMY.md">拆解一个游戏</a></h4>
+        <p>单文件内部的四层结构：UI 层、世界层、算法区、游戏层。为什么算法区必须不碰 DOM。</p>
+      </div>
+      <div>
+        <h4><a href="docs/MODDING.md">常见改造怎么做</a></h4>
+        <p>"加一关""换成我的美术""改手感""加一个新机制"—— 每种改造的具体改法和副作用。</p>
+      </div>
+      <div>
+        <h4><a href="docs/PATTERNS.md">可复用的模式</a></h4>
+        <p>固定步长、双缓冲缩放、对象池、种子随机、本地化……踩过的坑与结论。<a href="docs/PATTERNS.en.md">English</a></p>
+      </div>
+      <div>
+        <h4><a href="README.md">完整说明</a></h4>
+        <p>测试怎么组织、每个游戏教什么、已知限制。以及这些代码不打算解决什么问题。</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>每个游戏都是单个 HTML 文件，MIT 许可，随便拿去改。</span>
+    <span><a href="README.md">README</a>　·　<a href="docs/MODDING.md">改造指南</a></span>
+  </footer>
+
+</div>
+</body>
+</html>

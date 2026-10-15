@@ -1,0 +1,1058 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>平台跳跃 · 单文件像素游戏</title>
+<style>
+  :root{
+    --bg:#0c1018; --ink:#e8eef7; --dim:#7b8798;
+    --player:#ffd166; --coin:#ffc857; --goal:#6ee7a8; --spike:#ff6b81; --tile:#2f3a4d;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#05070b;overflow:hidden}
+  body{font:13px/1.5 ui-monospace,"Cascadia Mono",Consolas,monospace;color:var(--ink)}
+
+  #stage{position:absolute;left:0;top:0;transform-origin:0 0}
+  #world{display:block;image-rendering:pixelated;background:var(--bg)}
+  #ui{
+    position:absolute;left:0;top:0;width:640px;height:360px;
+    transform-origin:0 0;pointer-events:none;overflow:hidden;
+  }
+  .hud{
+    position:absolute;left:0;top:0;width:100%;
+    display:flex;justify-content:space-between;align-items:center;
+    padding:6px 16px;font-size:13px;letter-spacing:.05em;
+  }
+  .hud b{font-weight:500;color:var(--dim);font-size:12px}
+  #hudCoins{color:var(--coin)}
+  #hudLevel{color:var(--dim)}
+  .overlay{
+    position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:10px;
+    background:rgba(5,7,11,.85);text-align:center;padding:24px;
+  }
+  .overlay:not(.on){display:none}
+  .overlay:not(.on) *{pointer-events:none}
+  .overlay.on{pointer-events:auto}
+  #ovTitle{font-size:26px;font-weight:500;letter-spacing:.1em}
+  #ovBody{color:var(--dim);font-size:13px;max-width:440px;line-height:1.8}
+  #ovHint{color:var(--goal);font-size:12px;margin-top:6px;letter-spacing:.08em}
+  .keys{color:var(--player)}
+  kbd{color:var(--player);border:1px solid #37415180;border-radius:3px;padding:0 4px}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="world" width="640" height="360"></canvas>
+  <div id="ui">
+    <div class="hud">
+      <span><b id="lblCoins">金币</b> <span id="hudCoins">0 / 0</span></span>
+      <span id="hudLevel">第 1 关</span>
+      <span><b id="lblDeaths">死亡</b> <span id="hudDeaths">0</span></span>
+    </div>
+    <div id="ov" class="overlay on">
+      <h1 id="ovTitle">平台跳跃</h1>
+      <p id="ovBody"><kbd>←</kbd><kbd>→</kbd> 或 <kbd>A</kbd><kbd>D</kbd> 移动，<kbd>空格</kbd> 跳跃。<br>
+        长按跳得更高（松手会截断上升）。<br>
+        <span class="keys">=</span> 是单向平台，可以从下方穿上去；<span class="keys">^</span> 是尖刺。</p>
+      <p id="ovHint">按 空格 开始</p>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+
+/* #region CORE
+   纯算法区：瓦片解析与轴分离的碰撞求解。
+
+   "轴分离"是这里最值得学的东西：先只解 x 方向的移动，再只解 y 方向的移动。
+   如果两个轴一起解（比较常见的直觉写法），在贴着墙角移动时角色会被
+   卡住或者抖动 —— 因为斜向的一步同时撞到了侧面和地面，求解器分不清
+   该往哪个方向推。分开解之后，每个方向只有一种推法，天然不会冲突。 */
+const CORE = (function () {
+
+  const TILE = 16;
+
+  const EMPTY = 0, SOLID = 1, ONEWAY = 2, SPIKE = 3;
+  const CHAR2TILE = {
+    '.': EMPTY, ' ': EMPTY,
+    '#': SOLID,
+    '=': ONEWAY,
+    '^': SPIKE,
+    'o': EMPTY,      // 金币不是地形，单独收集
+    'P': EMPTY,      // 出生点同上
+    'G': EMPTY,      // 终点同上
+  };
+
+  /**
+   * 把字符画解析成地形网格 + 实体列表。
+   *
+   * 地形和实体分开存是刻意的：地形是查表用的二维数组（要快），
+   * 金币/终点是少数几个对象（要可变、要能标记"已拾取"）。
+   * 混在一个结构里会让两边都不好用。
+   */
+  function parseLevel(rows, legend) {
+    const lg = legend || CHAR2TILE;
+    const h = rows.length;
+    const w = Math.max(...rows.map(r => r.length));
+    const grid = [];
+    const coins = [];
+    let spawn = null;
+    let goal = null;
+
+    for (let r = 0; r < h; r++) {
+      const line = rows[r];
+      const out = new Array(w).fill(EMPTY);
+      for (let c = 0; c < w; c++) {
+        const ch = line[c] || '.';
+        if (ch === 'o') coins.push({ x: c * TILE + TILE / 2, y: r * TILE + TILE / 2, taken: false });
+        else if (ch === 'P') spawn = { x: c * TILE + 2, y: r * TILE + 2 };
+        else if (ch === 'G') goal = { x: c * TILE, y: r * TILE, w: TILE, h: TILE };
+        const t = Object.prototype.hasOwnProperty.call(lg, ch) ? lg[ch] : EMPTY;
+        out[c] = t;
+      }
+      grid.push(out);
+    }
+
+    /* 没有出生点要**报错**，不能默默给一个默认坐标。
+       静默兜底的后果是关卡作者把 @ 打错成别的字符，游戏照常启动、
+       玩家却在关卡角落（甚至墙里）出生，而错误信息指向完全无关的地方。 */
+    if (!spawn) throw new Error('关卡缺少出生点 @');
+    if (!goal) throw new Error('关卡缺少终点 G');
+
+    return { grid, coins, spawn, goal, cols: w, rows: h };
+  }
+
+  /**
+   * 查询某一格的地形。
+   *
+   * 越界规则是这一处最容易被想错的地方：
+   *   · 左右越界 → 实心。这是关卡的外墙，玩家不该跑出去。
+   *   · 上方越界 → 空。允许跳到屏幕顶之上（大多数平台跳跃都允许）。
+   *   · **下方越界 → 空**。这一条最初写成了实心，理由是"防止掉出世界"，
+   *     结果是在整个关卡下方铺了一层**隐形地板**：玩家掉进坑里不会摔死，
+   *     而是稳稳落在那层看不见的地上，再被坑壁夹住，永久卡死。
+   *     正确做法是让它掉出去，由游戏层判定"y 超过关卡底部 = 死亡"。
+   */
+  function tileAt(level, c, r) {
+    if (r < 0) return EMPTY;
+    if (r >= level.rows) return EMPTY;
+    if (c < 0 || c >= level.cols) return SOLID;
+    return level.grid[r][c];
+  }
+
+  function isSolidAt(level, c, r) { return tileAt(level, c, r) === SOLID; }
+
+  /** 一个盒子盖住了哪些列/行 */
+  function tileSpan(x, y, w, h) {
+    return {
+      c0: Math.floor(x / TILE),
+      c1: Math.floor((x + w - 0.001) / TILE),
+      r0: Math.floor(y / TILE),
+      r1: Math.floor((y + h - 0.001) / TILE),
+    };
+  }
+
+  /**
+   * 只解 x 方向。返回是否撞到墙。
+   * 前提：单步位移小于一个瓦片（调用方负责细分），否则会穿过薄墙。
+   */
+  function moveX(box, level, dx) {
+    if (!dx) return false;
+    box.x += dx;
+    const r0 = Math.floor(box.y / TILE);
+    const r1 = Math.floor((box.y + box.h - 0.001) / TILE);
+    if (dx > 0) {
+      const c = Math.floor((box.x + box.w - 0.001) / TILE);
+      for (let r = r0; r <= r1; r++) {
+        if (tileAt(level, c, r) === SOLID) { box.x = c * TILE - box.w; return true; }
+      }
+    } else {
+      const c = Math.floor(box.x / TILE);
+      for (let r = r0; r <= r1; r++) {
+        if (tileAt(level, c, r) === SOLID) { box.x = (c + 1) * TILE; return true; }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 只解 y 方向。返回 'floor' | 'ceil' | false。
+   *
+   * prevBottom 是移动前盒子的下边缘，单向平台靠它判断"是不是从上方落下来的"。
+   * 少了这个参数，单向平台就会变成"从下面跳时头撞到天花板" —— 一个
+   * 非常典型、只看代码很难发现的错误。
+   */
+  function moveY(box, level, dy, prevBottom) {
+    if (!dy) return false;
+    box.y += dy;
+    const c0 = Math.floor(box.x / TILE);
+    const c1 = Math.floor((box.x + box.w - 0.001) / TILE);
+
+    if (dy > 0) {
+      const r = Math.floor((box.y + box.h - 0.001) / TILE);
+      for (let c = c0; c <= c1; c++) {
+        const t = tileAt(level, c, r);
+        if (t === SOLID || (t === ONEWAY && prevBottom <= r * TILE + 0.6)) {
+          box.y = r * TILE - box.h;
+          return 'floor';
+        }
+      }
+    } else {
+      const r = Math.floor(box.y / TILE);
+      for (let c = c0; c <= c1; c++) {
+        if (tileAt(level, c, r) === SOLID) {   // 单向平台不挡上升
+          box.y = (r + 1) * TILE;
+          return 'ceil';
+        }
+      }
+    }
+    return false;
+  }
+
+  function overlap(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  /** 移动平台在 t 时刻的位置。用时间函数而不是累积位移，
+   *  这样平台位置可以随时重算，不会因为丢帧而漂移。 */
+  function moverPos(m, t) {
+    const off = Math.sin(t * m.speed + m.phase) * m.range;
+    return m.axis === 'y'
+      ? { x: m.x, y: m.y + off, dx: 0, dy: 0 }
+      : { x: m.x + off, y: m.y, dx: 0, dy: 0 };
+  }
+
+  /** 跳跃截断：松手时把上升速度砍掉一部分，形成"短跳/长跳" */
+  function cutJump(vy, factor) {
+    return vy < 0 ? vy * factor : vy;
+  }
+
+  /** 逼近目标值的指数平滑：与帧率无关，比线性逼近手感更稳 */
+  function approach(current, target, rate, dt) {
+    return current + (target - current) * (1 - Math.exp(-rate * dt));
+  }
+
+  return {
+    TILE, EMPTY, SOLID, ONEWAY, SPIKE, CHAR2TILE,
+    parseLevel, tileAt, isSolidAt, tileSpan, moveX, moveY, overlap,
+    moverPos, cutJump, approach,
+  };
+})();
+/* #endregion CORE */
+
+/* ================================================================== */
+
+const { TILE, SOLID, ONEWAY, SPIKE, parseLevel, tileAt, moveX, moveY,
+        overlap, moverPos, cutJump, approach } = CORE;
+
+const W = 640, H = 360;
+const VIEW_ROWS = 20;
+const OFFSET_Y = 20;                      // 关卡顶边在屏幕上的 y
+
+/* ---- 关卡：字符画 + 独立的移动平台清单 ----
+   '#' 实心  '=' 单向平台  '^' 尖刺  'o' 金币  'P' 出生  'G' 终点 */
+const LEVELS = [
+  {
+    name: '起步',
+    rows: [
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '..............ooo...............................',
+      '.............=====..............................',
+      '................................................',
+      '..........ooo...................................',
+      '.........=====..................................',
+      '.....P.......................................G..',
+      '##########....#########....#########....########',
+    ],
+    movers: [],
+  },
+  {
+    name: '尖刺',
+    rows: [
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '..............ooo...............................',
+      '.............=====..............................',
+      '.....P................^^^...............^^^..G..',
+      '#############....###############....############',
+    ],
+    movers: [],
+  },
+  {
+    name: '渡河',
+    /* 缺口统一为 5 格：一次跳跃能覆盖约 5.9 格，所以三条河都跳得过去 ——
+       移动平台提供的是"更稳的路线"，不是唯一解。
+
+       早先这里用的是 7~8 格的缺口，逼玩家必须等平台。玩法上说得通，
+       但带来一个实际代价：**自动化验证做不了**。自动驾驶没法"等平台飘过来"，
+       于是"这一关能不能通"就只能靠人肉试。缺口收窄到可跳越之后，
+       tests/smoke.test.mjs 里的自动驾驶能一次跑完四关，
+       关卡设计从此有了机器保障。 */
+    rows: [
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '.......................................ooo......',
+      '......................................=====.....',
+      '...P.........................................G..',
+      '#######.....##########.....##########.....######',
+    ],
+    movers: [
+      // 悬在第一道河上方（缺口 7-11，x 112..192），横向往返
+      { x: 144, y: 17 * 16, w: 32, h: 8, axis: 'x', range: 40, speed: 1.1, phase: 0 },
+      // 第二道河（缺口 22-26，x 352..432）
+      { x: 384, y: 17 * 16, w: 32, h: 8, axis: 'x', range: 40, speed: 0.9, phase: 1.7 },
+    ],
+  },
+  {
+    name: '升降',
+    rows: [
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '................................................',
+      '..........................ooo...................',
+      '.........................=====..................',
+      '................................................',
+      '..P..........................................G..',
+      '#####.....#####.....#####.....#####.....########',
+    ],
+    movers: [
+      // 纵向升降：最低点离地面只有 16px，站着就能等到它下来
+      { x: 112, y: 16 * 16, w: 32, h: 8, axis: 'y', range: 32, speed: 1.3, phase: 0.6 },
+      { x: 272, y: 16 * 16, w: 48, h: 8, axis: 'y', range: 40, speed: 1.0, phase: 2.2 },
+    ],
+  },
+];
+
+/* ---- 调参区：手感全靠这几个数字 ---- */
+const MAX_RUN      = 168;
+const ACCEL_GROUND = 980;
+const FRICTION     = 1420;
+const ACCEL_AIR    = 620;
+const DRAG_AIR     = 300;
+const GRAVITY      = 1500;
+const MAX_FALL     = 520;
+const JUMP_V       = 428;     // 跳起高度 ≈ JUMP_V²/(2·GRAVITY) ≈ 61px ≈ 3.8 格
+const JUMP_CUT     = 0.42;    // 松手时保留的上升速度比例
+const COYOTE       = 0.10;    // 离开地面后仍可起跳的宽限
+const JUMP_BUFFER  = 0.12;    // 落地前提前按跳的宽限
+const RESPAWN_HOLD = 520;
+
+const PLAYER_W = 11, PLAYER_H = 14;
+
+const cvs = document.getElementById('world');
+const ctx = cvs.getContext('2d');
+const ui = document.getElementById('ui');
+const stage = document.getElementById('stage');
+const $coins = document.getElementById('hudCoins');
+const $lblCoins = document.getElementById('lblCoins');
+const $lblDeaths = document.getElementById('lblDeaths');
+const $level = document.getElementById('hudLevel');
+const $deaths = document.getElementById('hudDeaths');
+const $ov = document.getElementById('ov');
+const $ovTitle = document.getElementById('ovTitle');
+const $ovBody = document.getElementById('ovBody');
+const $ovHint = document.getElementById('ovHint');
+
+/* ==================================================================
+   语言：两种语言都装在这一个文件里。
+
+   为什么不做成 platformer.en.html：那是两份要各自维护的代码，改一个 bug
+   得改两遍，迟早不一致。装在同一文件里，双语共用同一套逻辑，
+   只把文本抽出来 —— 也让测试能断言两种语言的键完全对齐。
+
+   检测顺序：URL 参数 ?lang=en  >  上次手动选择  >  浏览器语言
+   手动切换：按 L
+   ================================================================== */
+const TEXTS = {
+  zh: {
+    'doc.title': '平台跳跃 · 单文件像素游戏',
+    'hud.coins': '金币',
+    'hud.deaths': '死亡',
+    'hud.level': '第 {n} 关 · {name}',
+    'level.0': '起步',
+    'level.1': '尖刺',
+    'level.2': '渡河',
+    'level.3': '升降',
+    'start.title': '平台跳跃',
+    'start.body': '<kbd>←</kbd><kbd>→</kbd> 或 <kbd>A</kbd><kbd>D</kbd> 移动，<kbd>空格</kbd> 跳跃。<br>长按跳得更高（松手会截断上升）。<br><span class="keys">=</span> 是单向平台，可以从下方穿上去；<span class="keys">^</span> 是尖刺。',
+    'start.hint': '按 空格 开始',
+    'win.title': '全部通关',
+    'win.body': '金币 <span class="keys">{coins}</span>　死亡 {deaths} 次<br>四关全清。',
+    'win.hint': '按 空格 重新开始',
+    'clear.title': '第 {n} 关完成',
+    'clear.body': '『{name}』　金币 <span class="keys">{coins} / {total}</span>　死亡 {deaths} 次',
+    'clear.hint': '按 空格 进入下一关',
+    'pause.title': '已暂停',
+    'pause.hint': '按 空格 继续',
+  },
+  en: {
+    'doc.title': 'Platformer · Single-file pixel game',
+    'hud.coins': 'COINS',
+    'hud.deaths': 'DEATHS',
+    'hud.level': 'Level {n} · {name}',
+    'level.0': 'First Steps',
+    'level.1': 'Spikes',
+    'level.2': 'Crossing',
+    'level.3': 'Lifts',
+    'start.title': 'Platformer',
+    'start.body': '<kbd>←</kbd><kbd>→</kbd> or <kbd>A</kbd><kbd>D</kbd> to move, <kbd>SPACE</kbd> to jump.<br>Hold to jump higher (releasing cuts the rise short).<br><span class="keys">=</span> is a one-way platform you can pass through from below; <span class="keys">^</span> is a spike.',
+    'start.hint': 'Press SPACE to start',
+    'win.title': 'All Clear',
+    'win.body': 'Coins <span class="keys">{coins}</span>　deaths {deaths}<br>All four levels cleared.',
+    'win.hint': 'Press SPACE to start over',
+    'clear.title': 'Level {n} Clear',
+    'clear.body': '"{name}"　coins <span class="keys">{coins} / {total}</span>　deaths {deaths}',
+    'clear.hint': 'Press SPACE for the next level',
+    'pause.title': 'Paused',
+    'pause.hint': 'Press SPACE to resume',
+  },
+};
+
+function detectLang() {
+  // 1) URL 参数 —— 最高优先级，方便分享指定语言的链接
+  try {
+    const m = (window.location && window.location.search || '').match(/[?&]lang=(zh|en)\b/);
+    if (m) return m[1];
+  } catch (e) { /* file:// 下访问 location 可能受限 */ }
+
+  // 2) 上次的选择 —— 也要能读得到，否则刷新就跳回浏览器语言
+  try {
+    const saved = window.localStorage.getItem('sfpg.lang');
+    if (saved === 'zh' || saved === 'en') return saved;
+  } catch (e) { /* 隐私模式下会抛异常 */ }
+
+  // 3) 浏览器语言
+  try {
+    const nav = window.navigator || {};
+    const tag = nav.language || (nav.languages && nav.languages[0]) || '';
+    if (tag) return /^zh\b/i.test(tag) ? 'zh' : 'en';
+  } catch (e) { /* 忽略 */ }
+
+  return 'zh';   // 兜底：项目原始语言
+}
+
+let LANG = detectLang();
+
+/** 取文本。params 里的值会替换模板里的 {name} 占位符。 */
+function T(key, params) {
+  const table = TEXTS[LANG] || TEXTS.zh;
+  let s = Object.prototype.hasOwnProperty.call(table, key)
+    ? table[key]
+    : (TEXTS.zh[key] != null ? TEXTS.zh[key] : key);
+  if (params) {
+    s = s.replace(/\{(\w+)\}/g, (whole, name) =>
+      Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : whole);
+  }
+  return s;
+}
+
+/** 把语言同步到 <html lang> 和 <title>。给无障碍工具和搜索引擎看的。 */
+function syncDocLang() {
+  try { document.documentElement.setAttribute('lang', LANG === 'zh' ? 'zh-CN' : 'en'); } catch (e) { /* 忽略 */ }
+  try { document.title = T('doc.title'); } catch (e) { /* 忽略 */ }
+}
+
+function setLang(next) {
+  if (next !== 'zh' && next !== 'en') return;
+  LANG = next;
+  try { window.localStorage.setItem('sfpg.lang', LANG); } catch (e) { /* 降级 */ }
+  syncDocLang();
+  applyLang();
+}
+
+/* ---- 覆盖层：记住"当前该显示哪条文案"，而不是记住渲染好的字符串 ----
+   这样按 L 切语言时可以直接重绘，不需要每个调用点各写一遍刷新逻辑。
+
+   注意：**必须一开始就设好 overlayKeys**。放开局画面时它是 null 的话，
+   paintOverlay 会直接返回，于是"开局时按 L 切换语言"对开始界面毫无效果 ——
+   而其余场景（结算、通关）却是正常的，这种"只在某一屏失效"最难查。 */
+let overlayKeys = { titleKey: 'start.title', bodyKey: 'start.body', hintKey: 'start.hint', params: null };
+
+function showOverlay(titleKey, bodyKey, hintKey, params) {
+  overlayKeys = { titleKey, bodyKey, hintKey, params: params || null };
+  paintOverlay();
+  $ov.classList.add('on');
+}
+
+function paintOverlay() {
+  if (!overlayKeys) return;
+  const { titleKey, bodyKey, hintKey, params } = overlayKeys;
+  $ovTitle.textContent = T(titleKey, params);
+  if (bodyKey) $ovBody.innerHTML = T(bodyKey, params);
+  $ovHint.textContent = T(hintKey, params);
+}
+
+/** 切换语言时刷新静态文本；动态数值交给 syncHud */
+function applyLang() {
+  $lblCoins.textContent = T('hud.coins');
+  $lblDeaths.textContent = T('hud.deaths');
+  paintOverlay();
+  syncHud(true);      // 强制重写：等级栏之类的格式可能随语言变化
+}
+
+
+const G = {
+  state: 'start',       // start | play | dead | clear | win | pause
+  levelIndex: 0,
+  level: null,
+  player: null,
+  coins: 0,
+  totalCoins: 0,
+  deaths: 0,
+  time: 0,
+  camX: 0,
+  coyote: 0,
+  buffer: 0,
+  jumpHeld: false,
+  respawnTimer: 0,
+  shake: 0,
+  particles: [],
+  hitFlash: 0,
+};
+
+let actx = null;
+function sfx(freq, dur, type, gain) {
+  try {
+    if (typeof AudioContext === 'undefined') return;
+    if (!actx) actx = new AudioContext();
+    if (actx.state === 'suspended' && actx.resume) actx.resume();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'square';
+    o.frequency.value = freq;
+    g.gain.value = gain == null ? 0.03 : gain;
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch (e) { /* 静默降级 */ }
+}
+
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const s = Math.max(1, Math.floor(Math.min(vw / W, vh / H)));
+  cvs.style.width = (W * s) + 'px';
+  cvs.style.height = (H * s) + 'px';
+  ui.style.transform = 'scale(' + s + ')';
+  stage.style.left = Math.round((vw - W * s) / 2) + 'px';
+  stage.style.top = Math.round((vh - H * s) / 2) + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+function hideOverlay() { $ov.classList.remove('on'); }
+
+const hudCache = {};
+function setText(el, key, value, force) {
+  if (!force && hudCache[key] === value) return;
+  hudCache[key] = value;
+  el.textContent = value;
+}
+
+function syncHud(force) {
+  setText($coins, 'coins', G.coins + ' / ' + G.totalCoins, force);
+  setText($level, 'level', T('hud.level', {
+    n: G.levelIndex + 1, name: T('level.' + G.levelIndex),
+  }), force);
+  setText($deaths, 'deaths', String(G.deaths), force);
+}
+
+function loadLevel(i) {
+  G.levelIndex = Math.max(0, Math.min(LEVELS.length - 1, i));
+  const def = LEVELS[G.levelIndex];
+  G.level = parseLevel(def.rows);
+  G.movers = (def.movers || []).map(m => ({ ...m, px: m.x, py: m.y }));
+  G.totalCoins = G.level.coins.length;
+  G.coins = 0;
+  G.time = 0;
+  respawn();
+  G.state = 'play';
+  hideOverlay();
+  syncHud();
+}
+
+function respawn() {
+  const sp = G.level.spawn;
+  G.player = {
+    x: sp.x, y: sp.y, w: PLAYER_W, h: PLAYER_H,
+    vx: 0, vy: 0, grounded: false, face: 1, onMover: null, anim: 0,
+    jumpCut: false,
+  };
+  G.coyote = 0;
+  G.buffer = 0;
+  G.camX = Math.max(0, Math.min(G.level.cols * TILE - W, sp.x - W / 2));
+}
+
+function startRun() {
+  G.deaths = 0;
+  loadLevel(0);
+}
+
+function killPlayer() {
+  if (G.state !== 'play') return;
+  G.deaths++;
+  G.shake = 1;
+  G.hitFlash = 1;
+  sfx(150, 0.24, 'sawtooth', 0.045);
+  for (let i = 0; i < 14; i++) {
+    G.particles.push({
+      x: G.player.x + PLAYER_W / 2, y: G.player.y + PLAYER_H / 2,
+      vx: (Math.random() - 0.5) * 150, vy: -60 - Math.random() * 130,
+      life: 500, max: 500, color: '#ffd166',
+    });
+  }
+  G.state = 'dead';
+  G.respawnTimer = RESPAWN_HOLD;
+  syncHud();
+}
+
+/* ---- 物理 ---- */
+function physics(dt) {
+  const p = G.player;
+  const lv = G.level;
+
+  // 1) 移动平台先走，并记下本帧位移 —— 站在上面的玩家要跟着一起动
+  const prevMoverPos = new Map();
+  for (const m of G.movers) prevMoverPos.set(m, { x: m.px, y: m.py });
+  for (const m of G.movers) {
+    const pos = moverPos(m, G.time);
+    m.px = pos.x; m.py = pos.y;
+  }
+
+  if (p.onMover) {
+    const prev = prevMoverPos.get(p.onMover);
+    if (prev) { p.x += p.onMover.px - prev.x; p.y += p.onMover.py - prev.y; }
+  }
+
+  // 2) 水平输入
+  const want = (Input.right ? 1 : 0) - (Input.left ? 1 : 0);
+  if (want !== 0) {
+    p.face = want;
+    const a = p.grounded ? ACCEL_GROUND : ACCEL_AIR;
+    p.vx += want * a * dt;
+    if (p.vx > MAX_RUN) p.vx = MAX_RUN;
+    if (p.vx < -MAX_RUN) p.vx = -MAX_RUN;
+  } else {
+    const drag = p.grounded ? FRICTION : DRAG_AIR;
+    p.vx = approach(p.vx, 0, drag / Math.max(1, Math.abs(p.vx) || 1) * 0.9, dt);
+    if (Math.abs(p.vx) < 3) p.vx = 0;
+  }
+
+  // 3) 跳跃：缓冲 + 土狼时间
+  //    缓冲解决"落地前提前按了跳却没反应"，土狼时间解决"刚离开平台边缘
+  //    按跳没反应"。两个都是几十毫秒级的宽限，但对手感的影响是决定性的。
+  if (G.buffer > 0) G.buffer -= dt;
+  if (G.coyote > 0) G.coyote -= dt;
+
+  if (G.buffer > 0 && (p.grounded || G.coyote > 0)) {
+    p.vy = -JUMP_V;
+    G.buffer = 0;
+    G.coyote = 0;
+    p.grounded = false;
+    p.onMover = null;
+    p.jumpCut = false;      // 新的一次跳跃，重新允许截断
+    sfx(520, 0.06, 'square', 0.026);
+  }
+
+  /* 变量跳：松手就截断上升，让"轻点"和"长按"是两种高度。
+     必须加 jumpCut 标志位，否则截断会**每帧重复施加** ——
+     松手之后上升的每一帧都会把速度再乘一次 0.42，几帧之内
+     上升速度就被砍到接近零，轻点跳跃变成"完全跳不起来"。
+     这类缺陷在数值上完全合理（乘一次 0.42 看起来没问题），
+     只有真的去量跳跃高度才会暴露，所以测试里专门量了它。 */
+  if (!G.jumpHeld && p.vy < 0 && !p.jumpCut) {
+    p.vy = cutJump(p.vy, JUMP_CUT);
+    p.jumpCut = true;
+  }
+
+  // 4) 重力
+  p.vy += GRAVITY * dt;
+  if (p.vy > MAX_FALL) p.vy = MAX_FALL;
+
+  /* 5) 位移 —— 细分到每步不超过 4px。
+     下落速度上限 520px/s，在 1/120 步长下每步 4.3px，
+     已经逼近瓦片厚度的四分之一；再快就必须细分，否则会穿墙。 */
+  const steps = Math.max(1, Math.ceil(Math.max(Math.abs(p.vx), Math.abs(p.vy)) * dt / 4));
+  const sdt = dt / steps;
+  const wasGrounded = p.grounded;
+  p.grounded = false;
+  p.onMover = null;
+
+  for (let i = 0; i < steps; i++) {
+    const prevBottom = p.y + p.h;
+    moveX(p, lv, p.vx * sdt);
+    const hitY = moveY(p, lv, p.vy * sdt, prevBottom);
+    if (hitY === 'floor') { p.grounded = true; p.vy = 0; }
+    else if (hitY === 'ceil') { p.vy = 0; }
+  }
+
+  if (p.grounded) G.coyote = COYOTE;
+  else if (wasGrounded) G.coyote = COYOTE;   // 刚离开地面，保留宽限
+
+  // 6) 站在移动平台上？
+  if (p.grounded) {
+    for (const m of G.movers) {
+      if (p.x + p.w > m.px && p.x < m.px + m.w &&
+          Math.abs((p.y + p.h) - m.py) < 3) {
+        p.onMover = m;
+        break;
+      }
+    }
+  }
+
+  // 7) 掉出关卡
+  if (p.y > (lv.rows + 3) * TILE) { killPlayer(); return; }
+
+  // 8) 尖刺
+  const span = { c0: Math.floor(p.x / TILE), c1: Math.floor((p.x + p.w - 0.001) / TILE),
+                 r0: Math.floor(p.y / TILE), r1: Math.floor((p.y + p.h - 0.001) / TILE) };
+  for (let r = span.r0; r <= span.r1; r++) {
+    for (let c = span.c0; c <= span.c1; c++) {
+      if (tileAt(lv, c, r) === SPIKE) {
+        // 尖刺只画在格子下半部分，判定也缩一点，避免"擦到边就死"
+        if (p.y + p.h > r * TILE + 8) { killPlayer(); return; }
+      }
+    }
+  }
+
+  // 9) 金币
+  for (const coin of lv.coins) {
+    if (coin.taken) continue;
+    if (overlap(p, { x: coin.x - 6, y: coin.y - 6, w: 12, h: 12 })) {
+      coin.taken = true;
+      G.coins++;
+      sfx(880 + (G.coins % 5) * 70, 0.06, 'triangle', 0.026);
+      syncHud();
+    }
+  }
+
+  // 10) 终点
+  if (lv.goal && overlap(p, lv.goal)) {
+    G.state = 'clear';
+    sfx(760, 0.16, 'triangle', 0.04);
+    if (G.levelIndex + 1 >= LEVELS.length) {
+      G.state = 'win';
+      showOverlay('win.title', 'win.body', 'win.hint',
+                  { coins: G.coins, deaths: G.deaths });
+    } else {
+      showOverlay('clear.title', 'clear.body', 'clear.hint', {
+        n: G.levelIndex + 1,
+        name: T('level.' + G.levelIndex),
+        coins: G.coins, total: G.totalCoins, deaths: G.deaths,
+      });
+    }
+  }
+
+  p.anim += Math.abs(p.vx) * dt * 0.06;
+}
+
+function update(dt) {
+  const ms = dt * 1000;
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 2.6);
+  if (G.hitFlash > 0) G.hitFlash = Math.max(0, G.hitFlash - dt * 3.2);
+
+  for (const q of G.particles) {
+    q.life -= ms; q.vy += 620 * dt; q.x += q.vx * dt; q.y += q.vy * dt;
+    if (q.life <= 0) q.dead = true;
+  }
+  let n = 0;
+  for (let i = 0; i < G.particles.length; i++) if (!G.particles[i].dead) G.particles[n++] = G.particles[i];
+  G.particles.length = n;
+
+  if (G.state === 'dead') {
+    G.respawnTimer -= ms;
+    if (G.respawnTimer <= 0) { respawn(); G.state = 'play'; }
+    return;
+  }
+  if (G.state !== 'play') return;
+
+  G.time += dt;
+  physics(dt);
+
+  // 相机：带死区跟随，横向留出前瞻，纵向不滚动（关卡高度正好一屏）
+  const target = G.player.x + G.player.w / 2 + G.player.vx * 0.28 - W / 2;
+  const maxCam = Math.max(0, G.level.cols * TILE - W);
+  G.camX = Math.max(0, Math.min(maxCam, approach(G.camX, target, 6.5, dt)));
+}
+
+function render() {
+  const lv = G.level;
+  if (!lv) return;
+  const camX = Math.round(G.camX);
+  const camY = OFFSET_Y;
+
+  ctx.save();
+  if (G.shake > 0) {
+    const m = G.shake * G.shake * 10;
+    ctx.translate((Math.random() - 0.5) * m, (Math.random() - 0.5) * m);
+  }
+
+  ctx.fillStyle = '#0c1018';
+  ctx.fillRect(-16, -16, W + 32, H + 32);
+
+  // 远景视差：两层不同速度的方块，做一点纵深
+  ctx.fillStyle = 'rgba(255,255,255,0.028)';
+  for (let i = 0; i < 40; i++) {
+    const bx = ((i * 97 - camX * 0.25) % (W + 120) + W + 120) % (W + 120) - 60;
+    const by = 60 + (i * 53) % 200;
+    ctx.fillRect(bx, by, 26, 66);
+  }
+
+  // 瓦片
+  const c0 = Math.max(0, Math.floor(camX / TILE) - 1);
+  const c1 = Math.min(lv.cols - 1, Math.floor((camX + W) / TILE) + 1);
+  for (let r = 0; r < lv.rows; r++) {
+    for (let c = c0; c <= c1; c++) {
+      const t = lv.grid[r][c];
+      if (t === 0) continue;
+      const x = c * TILE - camX, y = r * TILE + camY;
+      if (t === SOLID) {
+        ctx.fillStyle = '#2f3a4d';
+        ctx.fillRect(x, y, TILE, TILE);
+        ctx.fillStyle = '#3d4b63';
+        ctx.fillRect(x, y, TILE, 3);
+        ctx.fillStyle = 'rgba(0,0,0,0.22)';
+        ctx.fillRect(x, y + TILE - 3, TILE, 3);
+      } else if (t === ONEWAY) {
+        ctx.fillStyle = '#6ee7a8';
+        ctx.fillRect(x, y, TILE, 4);
+        ctx.fillStyle = 'rgba(110,231,168,0.25)';
+        ctx.fillRect(x, y + 4, TILE, 2);
+      } else if (t === SPIKE) {
+        ctx.fillStyle = '#ff6b81';
+        for (let k = 0; k < 4; k++) {
+          ctx.fillRect(x + k * 4 + 1, y + 8, 2, 8);
+          ctx.fillRect(x + k * 4 + 2, y + 5, 1, 4);
+        }
+      }
+    }
+  }
+
+  // 移动平台
+  for (const m of G.movers) {
+    ctx.fillStyle = '#8ef0c8';
+    ctx.fillRect(m.px - camX, m.py + camY, m.w, m.h);
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.fillRect(m.px - camX, m.py + camY, m.w, 2);
+  }
+
+  // 金币
+  for (const coin of lv.coins) {
+    if (coin.taken) continue;
+    const x = coin.x - camX, y = coin.y + camY;
+    const bob = Math.sin(G.time * 3 + coin.x * 0.05) * 2;
+    ctx.fillStyle = '#ffc857';
+    ctx.fillRect(x - 4, y - 5 + bob, 8, 10);
+    ctx.fillStyle = 'rgba(255,200,87,0.28)';
+    ctx.fillRect(x - 6, y - 7 + bob, 12, 14);
+    ctx.fillStyle = '#fff1c9';
+    ctx.fillRect(x - 2, y - 3 + bob, 2, 6);
+  }
+
+  // 终点
+  if (lv.goal) {
+    const gx = lv.goal.x - camX, gy = lv.goal.y + camY;
+    ctx.fillStyle = '#3d4b63';
+    ctx.fillRect(gx + 6, gy - 22, 2, 38);
+    ctx.fillStyle = '#6ee7a8';
+    const wave = Math.sin(G.time * 4) * 2;
+    ctx.fillRect(gx + 8, gy - 22 + wave, 16, 11);
+    ctx.fillStyle = 'rgba(110,231,168,0.22)';
+    ctx.fillRect(gx - 4, gy - 30, 30, 48);
+  }
+
+  // 玩家
+  const p = G.player;
+  if (p) {
+    const x = Math.round(p.x - camX), y = Math.round(p.y + camY);
+    const alpha = G.state === 'dead' ? 0.45 : 1;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#ffd166';
+    ctx.fillRect(x, y, p.w, p.h);
+    ctx.fillStyle = '#8a6a1f';
+    const eyeX = p.face > 0 ? x + p.w - 5 : x + 2;
+    ctx.fillRect(eyeX, y + 3, 3, 3);
+    // 跑动时腿部两帧交替，静止时并拢
+    const running = Math.abs(p.vx) > 12 && p.grounded;
+    const phase = Math.floor(p.anim) % 2;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    if (running) {
+      ctx.fillRect(x + (phase ? 1 : 3), y + p.h - 3, 3, 3);
+      ctx.fillRect(x + p.w - (phase ? 4 : 6), y + p.h - 3, 3, 3);
+    } else {
+      ctx.fillRect(x + 2, y + p.h - 3, 3, 3);
+      ctx.fillRect(x + p.w - 5, y + p.h - 3, 3, 3);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // 粒子
+  for (const q of G.particles) {
+    ctx.globalAlpha = Math.max(0, q.life / q.max);
+    ctx.fillStyle = q.color;
+    ctx.fillRect(q.x - camX - 1.5, q.y + camY - 1.5, 3, 3);
+  }
+  ctx.globalAlpha = 1;
+
+  // 土狼时间 / 跳跃缓冲的可视化提示：调试用，也顺便让玩家理解手感
+  if (G.coyote > 0 && !G.player.grounded) {
+    ctx.fillStyle = 'rgba(142,240,200,0.5)';
+    ctx.fillRect(W - 8, H - 30 * (G.coyote / COYOTE), 4, 30 * (G.coyote / COYOTE));
+  }
+
+  if (G.hitFlash > 0) {
+    ctx.fillStyle = 'rgba(255,80,110,' + (G.hitFlash * 0.34) + ')';
+    ctx.fillRect(-16, -16, W + 32, H + 32);
+  }
+  ctx.restore();
+}
+
+/* ---- 输入 ---- */
+const Input = { left: false, right: false };
+
+addEventListener('keydown', e => {
+  const k = e.key;
+  // 双语：L 键随时切换，切换后立刻重绘界面（不打断当前对局）
+  if (k === 'l' || k === 'L') { setLang(LANG === 'zh' ? 'en' : 'zh'); return; }
+  if (k === 'ArrowLeft' || k === 'a' || k === 'A') Input.left = true;
+  if (k === 'ArrowRight' || k === 'd' || k === 'D') Input.right = true;
+  if (k === ' ' || k === 'ArrowUp' || k === 'w' || k === 'W') {
+    e.preventDefault();
+    if (G.state === 'start') { startRun(); return; }
+    if (G.state === 'clear') { loadLevel(G.levelIndex + 1); return; }
+    if (G.state === 'win') { startRun(); return; }
+    if (G.state === 'play') { G.buffer = JUMP_BUFFER; G.jumpHeld = true; }
+    return;
+  }
+  if (k === 'r' || k === 'R') { if (G.level) loadLevel(G.levelIndex); return; }
+  if (k === 'Escape' && G.state === 'play') { G.state = 'pause'; showOverlay('pause.title', null, 'pause.hint'); }
+});
+addEventListener('keyup', e => {
+  const k = e.key;
+  if (k === 'ArrowLeft' || k === 'a' || k === 'A') Input.left = false;
+  if (k === 'ArrowRight' || k === 'd' || k === 'D') Input.right = false;
+  if (k === ' ' || k === 'ArrowUp' || k === 'w' || k === 'W') G.jumpHeld = false;
+});
+
+/* ---- 主循环 ---- */
+const STEP = 1 / 120;
+let acc = 0, last = 0;
+function frame(now) {
+  if (!last) last = now;
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  let steps = 0;
+  while (acc >= STEP && steps < 16) { update(STEP); acc -= STEP; steps++; }
+  if (steps === 16) acc = 0;
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.__GAME__ = {
+  state: () => G.state,
+  setState: s => { G.state = s; },
+  levelIndex: () => G.levelIndex,
+  level: () => G.level,
+  player: () => G.player,
+  coins: () => G.coins,
+  totalCoins: () => G.totalCoins,
+  deaths: () => G.deaths,
+  movers: () => G.movers,
+  camX: () => G.camX,
+  coyote: () => G.coyote,
+  buffer: () => G.buffer,
+  time: () => G.time,
+  particles: () => G.particles,
+  start: () => startRun(),
+  loadLevel: i => loadLevel(i),
+  respawn: () => respawn(),
+  kill: () => killPlayer(),
+  /** 直接设定输入，供自动化测试的自动驾驶使用 */
+  setInput: o => {
+    if ('left' in o) Input.left = !!o.left;
+    if ('right' in o) Input.right = !!o.right;
+    if ('jumpHeld' in o) G.jumpHeld = !!o.jumpHeld;
+  },
+  /** 请求一次跳跃（写进缓冲，和玩家按键走同一条路径） */
+  requestJump: () => { G.buffer = JUMP_BUFFER; G.jumpHeld = true; },
+  /** 把玩家放到指定瓦片坐标，用来确定性地构造场景 */
+  teleport: (col, row) => {
+    const p = G.player;
+    p.x = col * TILE + 2; p.y = row * TILE + 2;
+    p.vx = 0; p.vy = 0; p.grounded = false; p.onMover = null;
+  },
+  setVelocity: (vx, vy) => { G.player.vx = vx; G.player.vy = vy; },
+  /** 自动驾驶用：前方指定偏移的格子是不是实心 */
+  solidAt: (col, row) => tileAt(G.level, col, row) === SOLID,
+  tileAt: (col, row) => tileAt(G.level, col, row),
+  syncHud,
+  /* ---- 双语 ---- */
+  lang: () => LANG,
+  setLang,
+  t: (key, params) => T(key, params),
+  textKeys: () => Object.keys(TEXTS.zh),
+  overlayKeys: () => (overlayKeys ? { ...overlayKeys } : null),
+};
+
+/* 启动：先把语言应用到静态文本上，再同步 HUD。
+   顺序不能反 —— applyLang 会强制重写 HUD，先 syncHud 只是白做一次。 */
+syncDocLang();
+applyLang();
+</script>
+</body>
+</html>

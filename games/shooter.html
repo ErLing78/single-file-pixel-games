@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>弹幕射击 · 单文件像素游戏</title>
+<style>
+  :root{
+    --bg:#07090f; --ink:#e8eef7; --dim:#7b8798;
+    --player:#6ee7a8; --shot:#a8f0d0; --foe:#ff6b81; --foeshot:#ffb3bd;
+    --boss:#c084fc; --gold:#ffc857;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#04060a;overflow:hidden}
+  body{font:13px/1.5 ui-monospace,"Cascadia Mono",Consolas,monospace;color:var(--ink)}
+
+  #stage{position:absolute;left:0;top:0;transform-origin:0 0}
+  #world{display:block;image-rendering:pixelated;background:var(--bg)}
+  #ui{
+    position:absolute;left:0;top:0;width:640px;height:360px;
+    transform-origin:0 0;pointer-events:none;overflow:hidden;
+  }
+  .hud{
+    position:absolute;left:0;top:0;width:100%;
+    display:flex;justify-content:space-between;align-items:center;
+    padding:7px 16px;font-size:13px;letter-spacing:.05em;
+  }
+  .hud b{font-weight:500;color:var(--dim);font-size:12px}
+  #hudLives{color:var(--player);letter-spacing:.14em}
+  #hudWave{color:var(--boss)}
+  #hudScore{color:var(--gold)}
+  .overlay{
+    position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:10px;
+    background:rgba(4,6,10,.86);text-align:center;padding:24px;
+  }
+  .overlay:not(.on){display:none}
+  .overlay:not(.on) *{pointer-events:none}
+  .overlay.on{pointer-events:auto}
+  #ovTitle{font-size:26px;font-weight:500;letter-spacing:.1em}
+  #ovBody{color:var(--dim);font-size:13px;max-width:450px;line-height:1.8}
+  #ovHint{color:var(--player);font-size:12px;margin-top:6px;letter-spacing:.08em}
+  .keys{color:var(--gold)}
+  kbd{color:var(--player);border:1px solid #37415180;border-radius:3px;padding:0 4px}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="world" width="640" height="360"></canvas>
+  <div id="ui">
+    <div class="hud">
+      <span><b id="lblScore">得分</b> <span id="hudScore">0</span></span>
+      <span id="hudWave">第 1 波</span>
+      <span><b id="lblLives">命</b> <span id="hudLives">♥♥♥</span></span>
+    </div>
+    <div id="ov" class="overlay on">
+      <h1 id="ovTitle">弹幕射击</h1>
+      <p id="ovBody"><kbd>←</kbd><kbd>→</kbd> 或 <kbd>A</kbd><kbd>D</kbd> 移动，按住 <kbd>空格</kbd> 开火。<br>
+        每 5 波出现一个首领。<br>
+        三种敌人各有各的弹幕：直射、环形、螺旋 —— 记住形状就能躲。</p>
+      <p id="ovHint">按 空格 开始</p>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+
+/* #region CORE
+   纯算法区。核心思想只有一句话：**弹幕是数据，不是代码**。
+
+   不要写 "if 类型是环形 then for i in 0..8 ..."。而是让每种弹幕变成
+   一个返回"速度向量数组"的纯函数，发射方只管把这些向量变成子弹。
+   带来的好处：新弹幕 = 新函数（不动发射逻辑），弹幕形状可以在测试里
+   直接断言（"环形应该有 8 发、模长相等、角度均匀"），而且同一个模式
+   可以被任何敌人复用。 */
+const CORE = (function () {
+
+  const TAU = Math.PI * 2;
+
+  function makeRNG(seed) {
+    let a = (seed >>> 0) || 1;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const fromAngle = (a, speed) => ({ vx: Math.cos(a) * speed, vy: Math.sin(a) * speed });
+
+  /** 朝目标点直射。count > 1 时按 spread 弧度扇形散开。 */
+  function patternAimed(sx, sy, tx, ty, speed, count, spread) {
+    const base = Math.atan2(ty - sy, tx - sx);
+    const n = Math.max(1, count || 1);
+    const sp = spread || 0;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const off = n === 1 ? 0 : (i / (n - 1) - 0.5) * sp;
+      out.push(fromAngle(base + off, speed));
+    }
+    return out;
+  }
+
+  /** 环形：均匀铺满一整圈，可选错开相位 */
+  function patternRing(count, speed, phase) {
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      out.push(fromAngle((i / count) * TAU + (phase || 0), speed));
+    }
+    return out;
+  }
+
+  /** 螺旋：只取一圈中的若干个等分点，靠调用方递增 phase 形成旋转 */
+  function patternSpiral(arms, speed, phase) {
+    const out = [];
+    const n = Math.max(1, arms || 1);
+    for (let i = 0; i < n; i++) out.push(fromAngle((i / n) * TAU + phase, speed));
+    return out;
+  }
+
+  /**
+   * 单波次的出场计划。
+   *
+   * 注意新兵种是**渐进登场**的：spinner 第 4 波才第一次出现、且只占 18%，
+   * 下一波 45%，之后才满权重。如果让它一出场就和其他兵种同权，
+   * 那一波的平均强度会直接跳一截 —— 这类"难度曲线的毛病出在分布、
+   * 不在数值"的问题，改权重比调血量有效得多。
+   */
+  function wavePlan(wave, rng) {
+    const plan = [];
+    if (wave % 5 === 0) {
+      plan.push({ kind: 'boss', at: 0, x: 320 });
+      return plan;
+    }
+    const count = Math.min(12, 4 + wave);
+
+    let spinnerWeight = 0;
+    if (wave >= 6) spinnerWeight = 0.34;
+    else if (wave >= 4) spinnerWeight = 0.18;
+
+    let turretWeight = wave < 3 ? 0 : (wave < 5 ? 0.28 : 0.36);
+
+    for (let i = 0; i < count; i++) {
+      const roll = rng();
+      let kind = 'drone';
+      if (roll < spinnerWeight) kind = 'spinner';
+      else if (roll < spinnerWeight + turretWeight) kind = 'turret';
+      plan.push({
+        kind,
+        at: i * Math.max(180, 620 - wave * 26),
+        x: 70 + rng() * 500,
+      });
+    }
+    return plan;
+  }
+
+  /** 圆形碰撞：两个圆的距离判定 */
+  function circleHit(ax, ay, ar, bx, by, br) {
+    const dx = ax - bx, dy = ay - by;
+    const r = ar + br;
+    return dx * dx + dy * dy <= r * r;
+  }
+
+  /** 难度随波次线性增长，但封顶 —— 无上限的曲线最终只会变成随机死亡 */
+  function difficulty(wave, cap) {
+    return Math.min(cap == null ? 2.4 : cap, 1 + (wave - 1) * 0.16);
+  }
+
+  return { makeRNG, patternAimed, patternRing, patternSpiral,
+           wavePlan, circleHit, difficulty, fromAngle, TAU };
+})();
+/* #endregion CORE */
+
+/* ================================================================== */
+
+const { makeRNG, patternAimed, patternRing, patternSpiral,
+        wavePlan, circleHit, difficulty } = CORE;
+
+const W = 640, H = 360;
+
+const cvs = document.getElementById('world');
+const ctx = cvs.getContext('2d');
+const ui = document.getElementById('ui');
+const stage = document.getElementById('stage');
+const $score = document.getElementById('hudScore');
+const $lblScore = document.getElementById('lblScore');
+const $lblLives = document.getElementById('lblLives');
+const $wave = document.getElementById('hudWave');
+const $lives = document.getElementById('hudLives');
+const $ov = document.getElementById('ov');
+const $ovTitle = document.getElementById('ovTitle');
+const $ovBody = document.getElementById('ovBody');
+const $ovHint = document.getElementById('ovHint');
+
+/* ==================================================================
+   语言：两种语言都装在这一个文件里。
+
+   为什么不做成 shooter.en.html：那是两份要各自维护的代码，改一个 bug
+   得改两遍，迟早不一致。装在同一文件里，双语共用同一套逻辑，
+   只把文本抽出来 —— 也让测试能断言两种语言的键完全对齐。
+
+   检测顺序：URL 参数 ?lang=en  >  上次手动选择  >  浏览器语言
+   手动切换：按 L
+   ================================================================== */
+const TEXTS = {
+  zh: {
+    'doc.title': '弹幕射击 · 单文件像素游戏',
+    'hud.score': '得分',
+    'hud.lives': '命',
+    'hud.wave': '第 {n} 波',
+    'start.title': '弹幕射击',
+    'start.body': '<kbd>←</kbd><kbd>→</kbd> 或 <kbd>A</kbd><kbd>D</kbd> 移动，按住 <kbd>空格</kbd> 开火。<br>每 5 波出现一个首领。<br>三种敌人各有各的弹幕：直射、环形、螺旋 —— 记住形状就能躲。',
+    'start.hint': '按 空格 开始',
+    'over.title': '结束',
+    'over.body': '得分 <span class="keys">{score}</span>　抵达第 {wave} 波',
+    'over.hint': '按 空格 重新开始',
+  },
+  en: {
+    'doc.title': 'Bullet Hell · Single-file pixel game',
+    'hud.score': 'SCORE',
+    'hud.lives': 'LIVES',
+    'hud.wave': 'WAVE {n}',
+    'start.title': 'Bullet Hell',
+    'start.body': '<kbd>←</kbd><kbd>→</kbd> or <kbd>A</kbd><kbd>D</kbd> to move, hold <kbd>SPACE</kbd> to fire.<br>A boss appears every 5 waves.<br>Three enemy types, three bullet patterns: aimed, ring, spiral — learn the shapes and you can dodge them.',
+    'start.hint': 'Press SPACE to start',
+    'over.title': 'Run Over',
+    'over.body': 'Score <span class="keys">{score}</span>　reached wave {wave}',
+    'over.hint': 'Press SPACE to play again',
+  },
+};
+
+function detectLang() {
+  // 1) URL 参数 —— 最高优先级，方便分享指定语言的链接
+  try {
+    const m = (window.location && window.location.search || '').match(/[?&]lang=(zh|en)\b/);
+    if (m) return m[1];
+  } catch (e) { /* file:// 下访问 location 可能受限 */ }
+
+  // 2) 上次的选择 —— 也要能读得到，否则刷新就跳回浏览器语言
+  try {
+    const saved = window.localStorage.getItem('sfpg.lang');
+    if (saved === 'zh' || saved === 'en') return saved;
+  } catch (e) { /* 隐私模式下会抛异常 */ }
+
+  // 3) 浏览器语言
+  try {
+    const nav = window.navigator || {};
+    const tag = nav.language || (nav.languages && nav.languages[0]) || '';
+    if (tag) return /^zh\b/i.test(tag) ? 'zh' : 'en';
+  } catch (e) { /* 忽略 */ }
+
+  return 'zh';   // 兜底：项目原始语言
+}
+
+let LANG = detectLang();
+
+/** 取文本。params 里的值会替换模板里的 {name} 占位符。 */
+function T(key, params) {
+  const table = TEXTS[LANG] || TEXTS.zh;
+  let s = Object.prototype.hasOwnProperty.call(table, key)
+    ? table[key]
+    : (TEXTS.zh[key] != null ? TEXTS.zh[key] : key);
+  if (params) {
+    s = s.replace(/\{(\w+)\}/g, (whole, name) =>
+      Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : whole);
+  }
+  return s;
+}
+
+/** 把语言同步到 <html lang> 和 <title>。给无障碍工具和搜索引擎看的。 */
+function syncDocLang() {
+  try { document.documentElement.setAttribute('lang', LANG === 'zh' ? 'zh-CN' : 'en'); } catch (e) { /* 忽略 */ }
+  try { document.title = T('doc.title'); } catch (e) { /* 忽略 */ }
+}
+
+function setLang(next) {
+  if (next !== 'zh' && next !== 'en') return;
+  LANG = next;
+  try { window.localStorage.setItem('sfpg.lang', LANG); } catch (e) { /* 降级 */ }
+  syncDocLang();
+  applyLang();
+}
+
+/* ---- 覆盖层：记住"当前该显示哪条文案"，而不是记住渲染好的字符串 ----
+   这样按 L 切语言时可以直接重绘，不需要每个调用点各写一遍刷新逻辑。
+
+   注意：**必须一开始就设好 overlayKeys**。放开局画面时它是 null 的话，
+   paintOverlay 会直接返回，于是"开局时按 L 切换语言"对开始界面毫无效果 ——
+   而其余场景（结算、通关）却是正常的，这种"只在某一屏失效"最难查。 */
+let overlayKeys = { titleKey: 'start.title', bodyKey: 'start.body', hintKey: 'start.hint', params: null };
+
+function showOverlay(titleKey, bodyKey, hintKey, params) {
+  overlayKeys = { titleKey, bodyKey, hintKey, params: params || null };
+  paintOverlay();
+  $ov.classList.add('on');
+}
+
+function paintOverlay() {
+  if (!overlayKeys) return;
+  const { titleKey, bodyKey, hintKey, params } = overlayKeys;
+  $ovTitle.textContent = T(titleKey, params);
+  if (bodyKey) $ovBody.innerHTML = T(bodyKey, params);
+  $ovHint.textContent = T(hintKey, params);
+}
+
+/** 切换语言时刷新静态文本；动态数值交给 syncHud */
+function applyLang() {
+  $lblScore.textContent = T('hud.score');
+  $lblLives.textContent = T('hud.lives');
+  paintOverlay();
+  syncHud(true);      // 强制重写：等级栏之类的格式可能随语言变化
+}
+
+
+/* ---- 调参区 ---- */
+const PLAYER_SPEED = 236;
+const PLAYER_W = 15, PLAYER_H = 16;
+const PLAYER_Y = H - 40;
+const FIRE_CD = 0.135;
+const SHOT_SPEED = 470;
+const INVULN = 1.4;
+const HIT_R = 2.5;              // 玩家判定半径远小于外观 —— 弹幕游戏的惯例
+const MAX_BULLETS = 900;        // 硬上限：宁可丢子弹也不能让帧率崩掉
+
+const ENEMY_DEF = {
+  drone:   { hp: 3,  r: 9,  color: '#ff6b81', score: 10, fireCd: 1.9, descend: 46 },
+  turret:  { hp: 6,  r: 11, color: '#ffb3bd', score: 20, fireCd: 2.5, descend: 34 },
+  spinner: { hp: 5,  r: 10, color: '#ffd166', score: 25, fireCd: 0.42, descend: 30 },
+  boss:    { hp: 90, r: 26, color: '#c084fc', score: 400, fireCd: 1.5, descend: 18 },
+};
+
+const G = {
+  state: 'start',       // start | play | dead | waveClear | over | win
+  player: null,
+  enemies: [],
+  ebullets: [],
+  pbullets: [],
+  particles: [],
+  stars: [],
+  wave: 0,
+  score: 0,
+  lives: 3,
+  rng: makeRNG(20261015),
+  seed: 20261015,
+  spawnQueue: [],
+  delay: 0,
+  shake: 0,
+  flash: 0,
+  hitStop: 0,
+  fireCd: 0,
+  bulletCount: 0,       // 本波已发射数，用于调试与测试
+};
+
+let actx = null;
+function sfx(freq, dur, type, gain) {
+  try {
+    if (typeof AudioContext === 'undefined') return;
+    if (!actx) actx = new AudioContext();
+    if (actx.state === 'suspended' && actx.resume) actx.resume();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'square';
+    o.frequency.value = freq;
+    g.gain.value = gain == null ? 0.022 : gain;
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch (e) { /* 静默降级 */ }
+}
+
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const s = Math.max(1, Math.floor(Math.min(vw / W, vh / H)));
+  cvs.style.width = (W * s) + 'px';
+  cvs.style.height = (H * s) + 'px';
+  ui.style.transform = 'scale(' + s + ')';
+  stage.style.left = Math.round((vw - W * s) / 2) + 'px';
+  stage.style.top = Math.round((vh - H * s) / 2) + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+function hideOverlay() { $ov.classList.remove('on'); }
+
+const hudCache = {};
+function setText(el, key, value, force) {
+  if (!force && hudCache[key] === value) return;
+  hudCache[key] = value;
+  el.textContent = value;
+}
+
+function syncHud(force) {
+  setText($score, 'score', String(G.score), force);
+  setText($wave, 'wave', T('hud.wave', { n: Math.max(1, G.wave) }), force);
+  setText($lives, 'lives', G.lives > 0 ? '♥'.repeat(G.lives) : '—', force);
+}
+
+function makeStars(rng) {
+  const out = [];
+  for (let i = 0; i < 70; i++) {
+    out.push({ x: rng() * W, y: rng() * H, z: 0.3 + rng() * 0.7 });
+  }
+  return out;
+}
+
+function startRun(seed) {
+  G.seed = seed == null ? (Date.now() & 0x7fffffff) : seed;
+  G.rng = makeRNG(G.seed);
+  G.stars = makeStars(G.rng);
+  G.player = { x: W / 2, y: PLAYER_Y, w: PLAYER_W, h: PLAYER_H, invuln: 1.2, vx: 0 };
+  G.enemies.length = 0;
+  G.ebullets.length = 0;
+  G.pbullets.length = 0;
+  G.particles.length = 0;
+  G.wave = 0;
+  G.score = 0;
+  G.lives = 3;
+  G.shake = 0; G.flash = 0; G.hitStop = 0;
+  G.fireCd = 0;
+  hideOverlay();
+  nextWave();
+  G.state = 'play';
+  syncHud();
+}
+
+function nextWave() {
+  G.wave++;
+  G.bulletCount = 0;
+  G.spawnQueue = wavePlan(G.wave, G.rng);
+  G.delay = 600;                 // 波次之间的喘息
+  syncHud();
+}
+
+function spawnEnemy(spec) {
+  const def = ENEMY_DEF[spec.kind];
+  const diff = difficulty(G.wave);
+  const e = {
+    kind: spec.kind,
+    x: spec.x,
+    y: spec.kind === 'boss' ? -50 : -20,
+    hp: Math.round(def.hp * (spec.kind === 'boss' ? 1 + Math.floor(G.wave / 5 - 1) * 0.6 : diff)),
+    maxHp: 0,
+    r: def.r,
+    color: def.color,
+    t: 0,
+    fireT: def.fireCd * 0.6,
+    phase: G.rng() * Math.PI * 2,
+    baseX: spec.x,
+    hoverY: spec.kind === 'turret' ? 70 + G.rng() * 60 : (spec.kind === 'spinner' ? 60 + G.rng() * 80 : H),
+    score: def.score,
+    hitFlash: 0,
+  };
+  e.maxHp = e.hp;
+  G.enemies.push(e);
+  return e;
+}
+
+/** 把一组速度向量变成真正的子弹。发射逻辑只有这一处。 */
+function emit(x, y, vectors, speedScale) {
+  for (const v of vectors) {
+    if (G.ebullets.length >= MAX_BULLETS) return;
+    G.ebullets.push({
+      x, y,
+      vx: v.vx * (speedScale || 1),
+      vy: v.vy * (speedScale || 1),
+      r: 3.2, life: 6,
+    });
+    G.bulletCount++;
+  }
+}
+
+function updateEnemy(e, dt) {
+  const def = ENEMY_DEF[e.kind];
+  e.t += dt;
+  if (e.hitFlash > 0) e.hitFlash = Math.max(0, e.hitFlash - dt * 5);
+
+  // 1) 先推进状态（受击停顿、死亡）
+  // 2) 再决定移动
+  // 顺序很重要：先做决策再做位移，否则会出现"决策用的是上一帧位置"的错位
+  if (e.kind === 'boss') {
+    e.y += (60 - e.y) * (1 - Math.exp(-2.2 * dt));
+    e.x = 320 + Math.sin(e.t * 0.55) * 190;
+  } else if (e.kind === 'turret') {
+    if (e.y < e.hoverY) e.y += def.descend * dt;
+    else e.x = e.baseX + Math.sin(e.t * 0.9) * 46;
+  } else if (e.kind === 'spinner') {
+    e.y += def.descend * dt;
+    e.x = e.baseX + Math.sin(e.t * 1.5 + e.phase) * 74;
+  } else {
+    e.y += def.descend * dt;
+    e.x = e.baseX + Math.sin(e.t * 1.1 + e.phase) * 26;
+  }
+
+  if (e.y - e.r > H + 40) e.dead = true;
+
+  // 3) 开火
+  e.fireT -= dt;
+  if (e.fireT <= 0 && e.y > 0 && e.y < H - 60) {
+    e.fireT = def.fireCd;
+    const p = G.player;
+    if (e.kind === 'drone') {
+      emit(e.x, e.y + e.r, patternAimed(e.x, e.y, p.x, p.y, 128, 1), 1);
+    } else if (e.kind === 'turret') {
+      const phase = e.t * 0.35;
+      emit(e.x, e.y, patternRing(8, 96, phase), 1);
+    } else if (e.kind === 'spinner') {
+      emit(e.x, e.y, patternSpiral(2, 112, e.t * 4.2), 1);
+      e.fireT = def.fireCd;
+    } else {
+      // 首领：三种模式轮转 —— 与其把每种都调强，不如让"下一招是什么"
+      // 成为玩家要读的信息。三种形状两两不同，玩家能学会区分。
+      const mode = Math.floor(e.t / def.fireCd) % 3;
+      if (mode === 0) emit(e.x, e.y, patternRing(14, 104, e.t), 1);
+      else if (mode === 1) emit(e.x, e.y + e.r, patternAimed(e.x, e.y, p.x, p.y, 150, 5, 0.6), 1);
+      else emit(e.x, e.y, patternSpiral(4, 118, e.t * 3.2), 1);
+    }
+    sfx(190, 0.03, 'sawtooth', 0.012);
+  }
+}
+
+function damageEnemy(e, dmg) {
+  e.hp -= dmg;
+  e.hitFlash = 1;
+  if (e.hp > 0) return false;
+  e.dead = true;
+  G.score += e.score;
+  G.hitStop = e.kind === 'boss' ? 0.14 : 0.028;
+  G.shake = Math.min(1, G.shake + (e.kind === 'boss' ? 0.9 : 0.14));
+  const n = e.kind === 'boss' ? 42 : 10;
+  for (let i = 0; i < n; i++) {
+    const a = G.rng() * Math.PI * 2, sp = 50 + G.rng() * 190;
+    G.particles.push({ x: e.x, y: e.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+                       life: 400 + G.rng() * 340, max: 740, color: e.color });
+  }
+  sfx(e.kind === 'boss' ? 110 : 300, e.kind === 'boss' ? 0.3 : 0.06, 'square', 0.03);
+  syncHud();
+  return true;
+}
+
+function hurtPlayer() {
+  const p = G.player;
+  if (p.invuln > 0 || G.state !== 'play') return;
+  G.lives--;
+  p.invuln = INVULN;
+  G.shake = 1;
+  G.flash = 1;
+  sfx(150, 0.26, 'sawtooth', 0.045);
+  for (let i = 0; i < 18; i++) {
+    const a = G.rng() * Math.PI * 2, sp = 60 + G.rng() * 160;
+    G.particles.push({ x: p.x, y: p.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+                       life: 460, max: 460, color: '#6ee7a8' });
+  }
+  syncHud();
+  if (G.lives <= 0) {
+    G.state = 'over';
+    showOverlay('over.title', 'over.body', 'over.hint',
+                { score: G.score, wave: G.wave });
+  }
+}
+
+function update(dt) {
+  const ms = dt * 1000;
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 2.6);
+  if (G.flash > 0) G.flash = Math.max(0, G.flash - dt * 3.0);
+
+  // 命中停顿：整个世界停一下，但表现层继续 —— 打击感的主要来源
+  if (G.hitStop > 0) {
+    G.hitStop = Math.max(0, G.hitStop - dt);
+    moveBullets(dt * 0.16);
+    decayParticles(dt);
+    return;
+  }
+
+  for (const s of G.stars) {
+    s.y += (14 + s.z * 46) * dt;
+    if (s.y > H) { s.y = -2; s.x = G.rng() * W; }
+  }
+  decayParticles(dt);
+
+  if (G.state !== 'play') return;
+
+  const p = G.player;
+  if (p.invuln > 0) p.invuln = Math.max(0, p.invuln - dt);
+
+  // 玩家水平移动
+  const want = (Input.right ? 1 : 0) - (Input.left ? 1 : 0);
+  p.vx += want * 1800 * dt;
+  if (!want) p.vx *= Math.exp(-14 * dt);
+  p.vx = Math.max(-PLAYER_SPEED, Math.min(PLAYER_SPEED, p.vx));
+  p.x += p.vx * dt;
+  p.x = Math.max(p.w / 2 + 4, Math.min(W - p.w / 2 - 4, p.x));
+
+  // 开火
+  G.fireCd -= dt;
+  if (Input.fire && G.fireCd <= 0) {
+    G.fireCd = FIRE_CD;
+    G.pbullets.push({ x: p.x - 4, y: p.y - 10, vx: 0, vy: -SHOT_SPEED, r: 3 });
+    G.pbullets.push({ x: p.x + 4, y: p.y - 10, vx: 0, vy: -SHOT_SPEED, r: 3 });
+  }
+
+  // 出场计划
+  G.delay -= ms;
+  while (G.spawnQueue.length && G.spawnQueue[0].at <= (600 - G.delay)) {
+    spawnEnemy(G.spawnQueue.shift());
+  }
+
+  for (const e of G.enemies) updateEnemy(e, dt);
+  prune(G.enemies, e => e.dead);
+
+  moveBullets(dt);
+
+  // 我方子弹 vs 敌人
+  for (const b of G.pbullets) {
+    if (b.dead) continue;
+    for (const e of G.enemies) {
+      if (e.dead) continue;
+      if (circleHit(b.x, b.y, b.r, e.x, e.y, e.r)) {
+        b.dead = true;
+        damageEnemy(e, 1);
+        break;
+      }
+    }
+  }
+  prune(G.pbullets, b => b.dead);
+
+  // 敌方子弹 vs 玩家
+  if (p.invuln <= 0) {
+    for (const b of G.ebullets) {
+      if (b.dead) continue;
+      if (circleHit(b.x, b.y, b.r, p.x, p.y, HIT_R)) { b.dead = true; hurtPlayer(); break; }
+    }
+  }
+  prune(G.ebullets, b => b.dead);
+
+  // 敌人撞玩家
+  if (p.invuln <= 0) {
+    for (const e of G.enemies) {
+      if (e.dead) continue;
+      if (circleHit(e.x, e.y, e.r, p.x, p.y, 7)) { hurtPlayer(); break; }
+    }
+  }
+
+  // 波次推进
+  if (!G.spawnQueue.length && !G.enemies.length && G.state === 'play') {
+    if (G.wave % 5 === 0) G.lives = Math.min(5, G.lives + 1);   // 打完首领补一命
+    nextWave();
+  }
+}
+
+function moveBullets(dt) {
+  for (const b of G.ebullets) {
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    b.life -= dt;
+    if (b.life <= 0 || b.y < -30 || b.y > H + 30 || b.x < -30 || b.x > W + 30) b.dead = true;
+  }
+  for (const b of G.pbullets) {
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    if (b.y < -20) b.dead = true;
+  }
+  prune(G.ebullets, b => b.dead);
+  prune(G.pbullets, b => b.dead);
+}
+
+function decayParticles(dt) {
+  for (const q of G.particles) {
+    q.life -= dt * 1000;
+    q.vy += 260 * dt;
+    q.x += q.vx * dt; q.y += q.vy * dt;
+    if (q.life <= 0) q.dead = true;
+  }
+  prune(G.particles, q => q.dead);
+}
+
+function prune(arr, isDead) {
+  let n = 0;
+  for (let i = 0; i < arr.length; i++) if (!isDead(arr[i])) arr[n++] = arr[i];
+  arr.length = n;
+}
+
+function render() {
+  ctx.save();
+  if (G.shake > 0) {
+    const m = G.shake * G.shake * 9;
+    ctx.translate((Math.random() - 0.5) * m, (Math.random() - 0.5) * m);
+  }
+
+  ctx.fillStyle = '#07090f';
+  ctx.fillRect(-14, -14, W + 28, H + 28);
+
+  // 星野（视差）
+  for (const s of G.stars) {
+    ctx.globalAlpha = 0.16 + s.z * 0.5;
+    ctx.fillStyle = '#9fb3d0';
+    ctx.fillRect(s.x, s.y, s.z > 0.75 ? 2 : 1, s.z > 0.75 ? 2 : 1);
+  }
+  ctx.globalAlpha = 1;
+
+  if (!G.player) { ctx.restore(); return; }
+
+  // 粒子
+  for (const q of G.particles) {
+    ctx.globalAlpha = Math.max(0, q.life / q.max);
+    ctx.fillStyle = q.color;
+    ctx.fillRect(q.x - 1.5, q.y - 1.5, 3, 3);
+  }
+  ctx.globalAlpha = 1;
+
+  // 敌方子弹：外圈淡、内芯亮，小尺寸下也能看清
+  for (const b of G.ebullets) {
+    ctx.fillStyle = 'rgba(255,120,150,0.3)';
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r + 1.6, 0, CORE.TAU); ctx.fill();
+    ctx.fillStyle = '#ffe3e8';
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r * 0.62, 0, CORE.TAU); ctx.fill();
+  }
+
+  // 我方子弹
+  for (const b of G.pbullets) {
+    ctx.fillStyle = '#a8f0d0';
+    ctx.fillRect(b.x - 1.5, b.y - 6, 3, 10);
+    ctx.fillStyle = 'rgba(168,240,208,0.24)';
+    ctx.fillRect(b.x - 3, b.y - 8, 6, 14);
+  }
+
+  // 敌人
+  for (const e of G.enemies) {
+    ctx.fillStyle = e.hitFlash > 0 ? '#ffffff' : e.color;
+    ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, CORE.TAU); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,0.42)';
+    ctx.beginPath(); ctx.arc(e.x, e.y + e.r * 0.25, e.r * 0.66, 0, CORE.TAU); ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(e.x - e.r * 0.45, e.y - e.r * 0.2, e.r * 0.3, e.r * 0.3);
+    ctx.fillRect(e.x + e.r * 0.15, e.y - e.r * 0.2, e.r * 0.3, e.r * 0.3);
+
+    // 血条：受伤才显示，避免满屏都是条
+    if (e.hp < e.maxHp) {
+      const w = e.r * 2.2;
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(e.x - w / 2, e.y - e.r - 8, w, 3);
+      ctx.fillStyle = e.kind === 'boss' ? '#c084fc' : '#ff6b81';
+      ctx.fillRect(e.x - w / 2, e.y - e.r - 8, w * (e.hp / e.maxHp), 3);
+    }
+  }
+
+  // 玩家（无敌期间闪烁）
+  const p = G.player;
+  const blink = p.invuln > 0 && Math.floor(p.invuln * 14) % 2 === 0;
+  if (!blink) {
+    ctx.fillStyle = '#6ee7a8';
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y - p.h / 2);
+    ctx.lineTo(p.x + p.w / 2, p.y + p.h / 2);
+    ctx.lineTo(p.x, p.y + p.h / 2 - 4);
+    ctx.lineTo(p.x - p.w / 2, p.y + p.h / 2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#c9ffe6';
+    ctx.fillRect(p.x - 1.5, p.y - 3, 3, 6);
+  }
+
+  if (G.flash > 0) {
+    ctx.fillStyle = 'rgba(255,80,110,' + (G.flash * 0.3) + ')';
+    ctx.fillRect(-14, -14, W + 28, H + 28);
+  }
+  ctx.restore();
+}
+
+/* ---- 输入 ---- */
+const Input = { left: false, right: false, fire: false };
+
+addEventListener('keydown', e => {
+  const k = e.key;
+  // 双语：L 键随时切换，切换后立刻重绘界面（不打断当前对局）
+  if (k === 'l' || k === 'L') { setLang(LANG === 'zh' ? 'en' : 'zh'); return; }
+  if (k === 'ArrowLeft' || k === 'a' || k === 'A') Input.left = true;
+  if (k === 'ArrowRight' || k === 'd' || k === 'D') Input.right = true;
+  if (k === ' ' || k === 'Enter') {
+    e.preventDefault();
+    Input.fire = true;
+    if (G.state === 'start') startRun();
+    else if (G.state === 'over') startRun(G.seed);
+  }
+});
+addEventListener('keyup', e => {
+  const k = e.key;
+  if (k === 'ArrowLeft' || k === 'a' || k === 'A') Input.left = false;
+  if (k === 'ArrowRight' || k === 'd' || k === 'D') Input.right = false;
+  if (k === ' ' || k === 'Enter') Input.fire = false;
+});
+
+/* ---- 主循环 ---- */
+const STEP = 1 / 120;
+let acc = 0, last = 0;
+function frame(now) {
+  if (!last) last = now;
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  let steps = 0;
+  while (acc >= STEP && steps < 16) { update(STEP); acc -= STEP; steps++; }
+  if (steps === 16) acc = 0;
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.__GAME__ = {
+  state: () => G.state,
+  setState: s => { G.state = s; },
+  player: () => G.player,
+  enemies: () => G.enemies,
+  ebullets: () => G.ebullets,
+  pbullets: () => G.pbullets,
+  particles: () => G.particles,
+  wave: () => G.wave,
+  score: () => G.score,
+  lives: () => G.lives,
+  bulletCount: () => G.bulletCount,
+  spawnQueue: () => G.spawnQueue,
+  start: seed => startRun(seed),
+  seed: () => G.seed,
+  setSeed: n => { G.rng = makeRNG(n); },
+  setInput: o => {
+    if ('left' in o) Input.left = !!o.left;
+    if ('right' in o) Input.right = !!o.right;
+    if ('fire' in o) Input.fire = !!o.fire;
+  },
+  nextWave: () => nextWave(),
+  /** 清空当前波次（包括还没出场的），用来确定性地测"清场推进" */
+  clearWave: () => {
+    G.enemies.length = 0;
+    G.spawnQueue.length = 0;
+  },
+  damageEnemy: (i, n) => { const e = G.enemies[i]; return e ? damageEnemy(e, n == null ? 1 : n) : false; },
+  hurt: () => hurtPlayer(),
+  clearEnemies: () => { for (const e of G.enemies) e.dead = true; prune(G.enemies, e => e.dead); },
+  clearBullets: () => { G.ebullets.length = 0; G.pbullets.length = 0; },
+  teleport: x => { G.player.x = x; },
+  syncHud,
+  /* ---- 双语 ---- */
+  lang: () => LANG,
+  setLang,
+  t: (key, params) => T(key, params),
+  textKeys: () => Object.keys(TEXTS.zh),
+  overlayKeys: () => (overlayKeys ? { ...overlayKeys } : null),
+};
+
+/* 启动：先把语言应用到静态文本上，再同步 HUD。
+   顺序不能反 —— applyLang 会强制重写 HUD，先 syncHud 只是白做一次。 */
+syncDocLang();
+applyLang();
+</script>
+</body>
+</html>

@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>推箱子 · 单文件像素游戏</title>
+<style>
+  :root{
+    --bg:#0b0e15; --ink:#e8eef7; --dim:#7b8798;
+    --wall:#39435a; --floor:#151b26; --goal:#ffc857;
+    --box:#c9852f; --boxok:#6ee7a8; --player:#4cc2ff; --hint:#8ef0c8;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#05070b;overflow:hidden}
+  body{font:13px/1.5 ui-monospace,"Cascadia Mono",Consolas,monospace;color:var(--ink)}
+
+  #stage{position:absolute;left:0;top:0;transform-origin:0 0}
+  #world{display:block;image-rendering:pixelated;background:var(--bg)}
+  #ui{
+    position:absolute;left:0;top:0;width:640px;height:360px;
+    transform-origin:0 0;pointer-events:none;overflow:hidden;
+  }
+  .hud{
+    position:absolute;left:0;top:0;width:100%;
+    display:flex;justify-content:space-between;align-items:center;
+    padding:8px 16px;font-size:13px;letter-spacing:.05em;
+  }
+  .hud b{font-weight:500;color:var(--dim);font-size:12px}
+  #hudBoxes{color:var(--goal)}
+  #hudMoves{color:var(--dim)}
+  #hint{
+    position:absolute;left:0;bottom:8px;width:100%;text-align:center;
+    font-size:12px;color:var(--hint);letter-spacing:.06em;
+    opacity:0;transition:opacity .18s;
+  }
+  #hint.on{opacity:1}
+  .overlay{
+    position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:10px;
+    background:rgba(5,7,11,.86);text-align:center;padding:24px;
+  }
+  .overlay:not(.on){display:none}
+  .overlay:not(.on) *{pointer-events:none}
+  .overlay.on{pointer-events:auto}
+  #ovTitle{font-size:26px;font-weight:500;letter-spacing:.1em}
+  #ovBody{color:var(--dim);font-size:13px;max-width:470px;line-height:1.8}
+  #ovHint{color:var(--player);font-size:12px;margin-top:6px;letter-spacing:.08em}
+  .keys{color:var(--goal)}
+  kbd{color:var(--player);border:1px solid #37415180;border-radius:3px;padding:0 4px}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="world" width="640" height="360"></canvas>
+  <div id="ui">
+    <div class="hud">
+      <span><b id="lblLevel">关卡</b> <span id="hudLevel">1 / 6</span></span>
+      <span><b id="lblBoxes">到位</b> <span id="hudBoxes">0 / 1</span></span>
+      <span id="hudMoves">步数 0 · 推动 0</span>
+    </div>
+    <div id="hint"></div>
+    <div id="ov" class="overlay on">
+      <h1 id="ovTitle">推箱子</h1>
+      <p id="ovBody">方向键或 WASD 移动。把每个箱子推到金色目标点上。<br>
+        只能<b>推</b>不能拉 —— 箱子被推进死角就再也出不来了。<br>
+        <kbd>Z</kbd> 撤销一步，<kbd>R</kbd> 重来本关。</p>
+      <p id="ovHint">按 空格 开始</p>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+
+/* #region CORE
+   纯算法区。这一关最值得学的是**把移动写成不可变操作**：
+   tryMove(state, dx, dy) 不修改传入的 state，而是返回一个全新的 state
+   （走不了就返回 null）。看起来只是风格问题，但它一次性带来三样东西：
+
+     1. 撤销栈  —— 把旧 state 压栈即可，不需要写"反向操作"
+     2. 求解器  —— BFS 直接在这个函数上跑，同一份规则不会有两处实现
+     3. 可回放  —— 状态序列就是录像
+
+   如果写成"就地修改 G.player.x"，上面三样都得各写一遍，
+   而且三份实现迟早会跟规则不一致。 */
+const CORE = (function () {
+
+  const WALL = '#', FLOOR = ' ', GOAL = '.', BOX = '$', BOX_ON = '*', PLAYER = '@', PLAYER_ON = '+';
+
+  const key = (x, y) => x + ',' + y;
+
+  function parseLevel(rows) {
+    const h = rows.length;
+    const w = Math.max(...rows.map(r => r.length));
+    const walls = [];
+    const goals = new Set();
+    const boxes = new Set();
+    let px = 0, py = 0, found = false;
+
+    for (let r = 0; r < h; r++) {
+      const line = rows[r];
+      const row = new Array(w).fill(false);
+      for (let c = 0; c < w; c++) {
+        const ch = line[c] || ' ';
+        if (ch === WALL) row[c] = true;
+        else if (ch === GOAL) goals.add(key(c, r));
+        else if (ch === BOX) boxes.add(key(c, r));
+        else if (ch === BOX_ON) { boxes.add(key(c, r)); goals.add(key(c, r)); }
+        else if (ch === PLAYER) { px = c; py = r; found = true; }
+        else if (ch === PLAYER_ON) { px = c; py = r; found = true; goals.add(key(c, r)); }
+      }
+      walls.push(row);
+    }
+    if (!found) throw new Error('关卡缺少玩家出生点 @');
+    return { w, h, walls, goals, boxes, px, py, moves: 0, pushes: 0 };
+  }
+
+  function isWall(s, x, y) {
+    if (y < 0 || y >= s.h || x < 0 || x >= s.w) return true;
+    return s.walls[y][x];
+  }
+
+  /**
+   * 尝试往 (dx, dy) 走一步。
+   * 返回**新的**状态；走不通返回 null。
+   * 注意这里没有任何副作用 —— 调用方拿到的要么是一个能用的新状态，
+   * 要么是明确的失败信号，不存在"改了一半"的中间态。
+   */
+  function tryMove(s, dx, dy) {
+    const nx = s.px + dx, ny = s.py + dy;
+    if (isWall(s, nx, ny)) return null;
+
+    const nk = key(nx, ny);
+    if (s.boxes.has(nk)) {
+      const bx = nx + dx, by = ny + dy;
+      if (isWall(s, bx, by)) return null;
+      if (s.boxes.has(key(bx, by))) return null;       // 两个箱子推不动
+      const boxes = new Set(s.boxes);
+      boxes.delete(nk);
+      boxes.add(key(bx, by));
+      return { ...s, boxes, px: nx, py: ny, moves: s.moves + 1, pushes: s.pushes + 1 };
+    }
+
+    return { ...s, px: nx, py: ny, moves: s.moves + 1 };
+  }
+
+  function isSolved(s) {
+    for (const b of s.boxes) if (!s.goals.has(b)) return false;
+    return true;
+  }
+
+  function boxesOnGoal(s) {
+    let n = 0;
+    for (const b of s.boxes) if (s.goals.has(b)) n++;
+    return n;
+  }
+
+  /**
+   * 死角检测：不在目标点上的箱子，若被卡在墙壁拐角或贴着一面墙
+   * 且该墙的另一侧还有墙，就永远推不出来了。
+   *
+   * 这是"提示"而不是"失败判定" —— 游戏不该因为玩家走进死局就自动
+   * 结束，但主动告诉他"这箱子废了"能省掉大量无效尝试。
+   * 只查最简单的两种情况（墙角、贴墙），完整死锁分析要复杂得多，
+   * 而这个粗糙版本已经能覆盖绝大多数实际死局。
+   */
+  function isDeadlocked(s) {
+    for (const b of s.boxes) {
+      if (s.goals.has(b)) continue;                 // 已在目标点的箱子不算
+      const [x, y] = b.split(',').map(Number);
+      const up = isWall(s, x, y - 1), down = isWall(s, x, y + 1);
+      const left = isWall(s, x - 1, y), right = isWall(s, x + 1, y);
+      // 卡在墙角
+      if ((up || down) && (left || right)) return true;
+      // 贴着不能移动的连续墙面
+      if (up && down) return true;
+      if (left && right) return true;
+    }
+    return false;
+  }
+
+  /** 状态指纹：求解器去重用 */
+  function fingerprint(s) {
+    return s.px + ',' + s.py + '|' + Array.from(s.boxes).sort().join(';');
+  }
+
+  return { key, parseLevel, isWall, tryMove, isSolved, boxesOnGoal, isDeadlocked, fingerprint };
+})();
+/* #endregion CORE */
+
+/* ================================================================== */
+
+const { parseLevel, isWall, tryMove, isSolved, boxesOnGoal, isDeadlocked, key } = CORE;
+
+const W = 640, H = 360;
+
+/* ---- 关卡：经典推箱子字符格式 ----
+   '#' 墙  ' ' 地板  '.' 目标  '$' 箱子  '*' 箱子在目标上  '@' 玩家  '+' 玩家在目标上
+   每一关都由 tests/core.test.mjs 里的 BFS 求解器验证过"确实可解" ——
+   手写的关卡最容易出的问题就是根本无解，而肉眼几乎看不出来。 */
+const LEVELS = [
+  [
+    '#######',
+    '#     #',
+    '# @$. #',
+    '#     #',
+    '#######',
+  ],
+  [
+    '#######',
+    '#  .  #',
+    '#  $  #',
+    '#  @  #',
+    '#######',
+  ],
+  [
+    '########',
+    '#      #',
+    '# .$   #',
+    '#  @   #',
+    '#      #',
+    '########',
+  ],
+  [
+    /* 这一关起初是「两个箱子都往上推」的对称设计，但下面那个箱子
+       **根本推不动** —— 要把它往上推，玩家必须站在它下方，而那里是墙。
+       人眼几乎看不出这种问题（画面完全正常、走位也自然），
+       是 tests/core.test.mjs 里的 BFS 求解器把它揪出来的。
+       改成上推一次、下推一次，两条路都通。 */
+    '########',
+    '#      #',
+    '#  .   #',
+    '#  $   #',
+    '#  @   #',
+    '#      #',
+    '#  $   #',
+    '#  .   #',
+    '########',
+  ],
+  [
+    '#########',
+    '#       #',
+    '#  $ .  #',
+    '#  @    #',
+    '#   .$  #',
+    '#       #',
+    '#########',
+  ],
+  [
+    '##########',
+    '#        #',
+    '#  .  .  #',
+    '#  $  $  #',
+    '#   @    #',
+    '#   $    #',
+    '#   .    #',
+    '##########',
+  ],
+];
+
+const cvs = document.getElementById('world');
+const ctx = cvs.getContext('2d');
+const ui = document.getElementById('ui');
+const stage = document.getElementById('stage');
+const $level = document.getElementById('hudLevel');
+const $lblLevel = document.getElementById('lblLevel');
+const $lblBoxes = document.getElementById('lblBoxes');
+const $boxes = document.getElementById('hudBoxes');
+const $moves = document.getElementById('hudMoves');
+const $hint = document.getElementById('hint');
+const $ov = document.getElementById('ov');
+const $ovTitle = document.getElementById('ovTitle');
+const $ovBody = document.getElementById('ovBody');
+const $ovHint = document.getElementById('ovHint');
+
+/* ==================================================================
+   语言：两种语言都装在这一个文件里。
+
+   为什么不做成 sokoban.en.html：那是两份要各自维护的代码，改一个 bug
+   得改两遍，迟早不一致。装在同一文件里，双语共用同一套逻辑，
+   只把文本抽出来 —— 也让测试能断言两种语言的键完全对齐。
+
+   检测顺序：URL 参数 ?lang=en  >  上次手动选择  >  浏览器语言
+   手动切换：按 L
+   ================================================================== */
+const TEXTS = {
+  zh: {
+    'doc.title': '推箱子 · 单文件像素游戏',
+    'hud.level': '关卡',
+    'hud.boxes': '到位',
+    'hud.moves': '步数 {moves} · 推动 {pushes}',
+    'start.title': '推箱子',
+    'start.body': '方向键或 WASD 移动。把每个箱子推到金色目标点上。<br>只能<b>推</b>不能拉 —— 箱子被推进死角就再也出不来了。<br><kbd>Z</kbd> 撤销一步，<kbd>R</kbd> 重来本关。',
+    'start.hint': '按 空格 开始',
+    'win.title': '全部通关',
+    'win.body': '六个关卡全部解决。<br>步数 <span class="keys">{moves}</span>　推动 <span class="keys">{pushes}</span>',
+    'win.hint': '按 空格 重新开始',
+    'clear.title': '第 {n} 关完成',
+    'clear.body': '步数 <span class="keys">{moves}</span>　推动 <span class="keys">{pushes}</span>',
+    'clear.hint': '按 空格 进入下一关',
+    'pause.title': '已暂停',
+    'pause.hint': '按 空格 继续',
+    'hint.deadlock': '有箱子被推进了死角 —— 按 Z 撤销或按 R 重来',
+    'hint.noUndo': '已经退到最开始了',
+  },
+  en: {
+    'doc.title': 'Sokoban · Single-file pixel game',
+    'hud.level': 'LEVEL',
+    'hud.boxes': 'IN PLACE',
+    'hud.moves': 'moves {moves} · pushes {pushes}',
+    'start.title': 'Sokoban',
+    'start.body': 'Move with the arrow keys or WASD. Push every box onto a gold target.<br>You can only <b>push</b>, never pull — a box pushed into a corner is stuck for good.<br><kbd>Z</kbd> undoes a move, <kbd>R</kbd> restarts the level.',
+    'start.hint': 'Press SPACE to start',
+    'win.title': 'All Clear',
+    'win.body': 'All six levels solved.<br>Moves <span class="keys">{moves}</span>　pushes <span class="keys">{pushes}</span>',
+    'win.hint': 'Press SPACE to start over',
+    'clear.title': 'Level {n} Clear',
+    'clear.body': 'Moves <span class="keys">{moves}</span>　pushes <span class="keys">{pushes}</span>',
+    'clear.hint': 'Press SPACE for the next level',
+    'pause.title': 'Paused',
+    'pause.hint': 'Press SPACE to resume',
+    'hint.deadlock': 'A box is stuck in a corner — press Z to undo, or R to restart',
+    'hint.noUndo': 'Already back at the very first move',
+  },
+};
+
+function detectLang() {
+  // 1) URL 参数 —— 最高优先级，方便分享指定语言的链接
+  try {
+    const m = (window.location && window.location.search || '').match(/[?&]lang=(zh|en)\b/);
+    if (m) return m[1];
+  } catch (e) { /* file:// 下访问 location 可能受限 */ }
+
+  // 2) 上次的选择 —— 也要能读得到，否则刷新就跳回浏览器语言
+  try {
+    const saved = window.localStorage.getItem('sfpg.lang');
+    if (saved === 'zh' || saved === 'en') return saved;
+  } catch (e) { /* 隐私模式下会抛异常 */ }
+
+  // 3) 浏览器语言
+  try {
+    const nav = window.navigator || {};
+    const tag = nav.language || (nav.languages && nav.languages[0]) || '';
+    if (tag) return /^zh\b/i.test(tag) ? 'zh' : 'en';
+  } catch (e) { /* 忽略 */ }
+
+  return 'zh';   // 兜底：项目原始语言
+}
+
+let LANG = detectLang();
+
+/** 取文本。params 里的值会替换模板里的 {name} 占位符。 */
+function T(key, params) {
+  const table = TEXTS[LANG] || TEXTS.zh;
+  let s = Object.prototype.hasOwnProperty.call(table, key)
+    ? table[key]
+    : (TEXTS.zh[key] != null ? TEXTS.zh[key] : key);
+  if (params) {
+    s = s.replace(/\{(\w+)\}/g, (whole, name) =>
+      Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : whole);
+  }
+  return s;
+}
+
+/** 把语言同步到 <html lang> 和 <title>。给无障碍工具和搜索引擎看的。 */
+function syncDocLang() {
+  try { document.documentElement.setAttribute('lang', LANG === 'zh' ? 'zh-CN' : 'en'); } catch (e) { /* 忽略 */ }
+  try { document.title = T('doc.title'); } catch (e) { /* 忽略 */ }
+}
+
+function setLang(next) {
+  if (next !== 'zh' && next !== 'en') return;
+  LANG = next;
+  try { window.localStorage.setItem('sfpg.lang', LANG); } catch (e) { /* 降级 */ }
+  syncDocLang();
+  applyLang();
+}
+
+/* ---- 覆盖层：记住"当前该显示哪条文案"，而不是记住渲染好的字符串 ----
+   这样按 L 切语言时可以直接重绘，不需要每个调用点各写一遍刷新逻辑。
+
+   注意：**必须一开始就设好 overlayKeys**。放开局画面时它是 null 的话，
+   paintOverlay 会直接返回，于是"开局时按 L 切换语言"对开始界面毫无效果 ——
+   而其余场景（结算、通关）却是正常的，这种"只在某一屏失效"最难查。 */
+let overlayKeys = { titleKey: 'start.title', bodyKey: 'start.body', hintKey: 'start.hint', params: null };
+
+function showOverlay(titleKey, bodyKey, hintKey, params) {
+  overlayKeys = { titleKey, bodyKey, hintKey, params: params || null };
+  paintOverlay();
+  $ov.classList.add('on');
+}
+
+function paintOverlay() {
+  if (!overlayKeys) return;
+  const { titleKey, bodyKey, hintKey, params } = overlayKeys;
+  $ovTitle.textContent = T(titleKey, params);
+  if (bodyKey) $ovBody.innerHTML = T(bodyKey, params);
+  $ovHint.textContent = T(hintKey, params);
+}
+
+/** 切换语言时刷新静态文本；动态数值交给 syncHud */
+function applyLang() {
+  $lblLevel.textContent = T('hud.level');
+  $lblBoxes.textContent = T('hud.boxes');
+  paintOverlay();
+  syncHud(true);      // 强制重写：等级栏之类的格式可能随语言变化
+}
+
+
+const G = {
+  state: 'start',        // start | play | solved | win | pause
+  levelIndex: 0,
+  state0: null,          // 关卡的初始状态（重来用）
+  cur: null,             // 当前状态（不可变对象）
+  undo: [],              // 撤销栈：存的是"上一步的整个状态"
+  cell: 32,
+  ox: 0, oy: 0,
+  anim: 0,               // 玩家平滑移动的插值进度
+  prevPx: 0, prevPy: 0,
+  goalPulse: 0,
+  shake: 0,
+  solvedTimer: 0,
+};
+
+let actx = null;
+function sfx(freq, dur, type, gain) {
+  try {
+    if (typeof AudioContext === 'undefined') return;
+    if (!actx) actx = new AudioContext();
+    if (actx.state === 'suspended' && actx.resume) actx.resume();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'square';
+    o.frequency.value = freq;
+    g.gain.value = gain == null ? 0.03 : gain;
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch (e) { /* 静默降级 */ }
+}
+
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const s = Math.max(1, Math.floor(Math.min(vw / W, vh / H)));
+  cvs.style.width = (W * s) + 'px';
+  cvs.style.height = (H * s) + 'px';
+  ui.style.transform = 'scale(' + s + ')';
+  stage.style.left = Math.round((vw - W * s) / 2) + 'px';
+  stage.style.top = Math.round((vh - H * s) / 2) + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+function hideOverlay() { $ov.classList.remove('on'); }
+
+function layout() {
+  const s = G.cur;
+  const availW = W - 48, availH = H - 104;
+  G.cell = Math.max(16, Math.min(44, Math.floor(Math.min(availW / s.w, availH / s.h))));
+  G.ox = Math.round((W - s.w * G.cell) / 2);
+  G.oy = Math.round(46 + (availH - s.h * G.cell) / 2);
+}
+
+function loadLevel(i) {
+  G.levelIndex = Math.max(0, Math.min(LEVELS.length - 1, i));
+  G.state0 = parseLevel(LEVELS[G.levelIndex]);
+  G.cur = G.state0;
+  G.undo.length = 0;
+  G.anim = 1;
+  G.prevPx = G.cur.px; G.prevPy = G.cur.py;
+  layout();
+  G.state = 'play';
+  hideOverlay();
+  setHint('');
+  syncHud();
+}
+
+const hudCache = {};
+function setText(el, key, value, force) {
+  if (!force && hudCache[key] === value) return;
+  hudCache[key] = value;
+  el.textContent = value;
+}
+
+function syncHud(force) {
+  const s = G.cur;
+  /* 关卡还没载入时直接返回。
+     脚本最后一行会调一次 syncHud 让 HUD 显示初始值，但那时 G.cur 还是 null ——
+     少了这个守卫，打开页面就会抛 TypeError（游戏其实还能玩，因为事件
+     监听早就注册好了，但控制台里躺着一个红字，看起来像坏了一样）。 */
+  if (!s) return;
+  setText($level, 'level', (G.levelIndex + 1) + ' / ' + LEVELS.length, force);
+  setText($boxes, 'boxes', boxesOnGoal(s) + ' / ' + s.boxes.size, force);
+  setText($moves, 'moves', T('hud.moves', { moves: s.moves, pushes: s.pushes }), force);
+}
+
+let hintTimer = 0;
+function setHint(text) {
+  $hint.textContent = text;
+  $hint.classList.toggle('on', !!text);
+}
+
+function move(dx, dy) {
+  if (G.state !== 'play') return;
+  const next = tryMove(G.cur, dx, dy);
+  if (!next) { sfx(180, 0.05, 'square', 0.02); G.shake = 0.25; return; }
+
+  G.undo.push(G.cur);           // 撤销栈只需要存旧状态 —— 不用写"反向操作"
+  G.prevPx = G.cur.px; G.prevPy = G.cur.py;
+  const pushed = next.pushes > G.cur.pushes;
+  G.cur = next;
+  G.anim = 0;
+  sfx(pushed ? 300 : 420, 0.045, 'square', pushed ? 0.028 : 0.018);
+  if (pushed) G.goalPulse = 1;
+  syncHud();
+
+  if (isSolved(G.cur)) {
+    G.state = 'solved';
+    G.solvedTimer = 420;
+    sfx(880, 0.18, 'triangle', 0.045);
+  } else if (isDeadlocked(G.cur)) {
+    setHint(T('hint.deadlock'));
+  } else {
+    setHint('');
+  }
+}
+
+function undo() {
+  if (G.state !== 'play' && G.state !== 'solved') return;
+  if (!G.undo.length) { setHint(T('hint.noUndo')); return; }
+  const prev = G.undo.pop();
+  G.prevPx = G.cur.px; G.prevPy = G.cur.py;
+  G.cur = prev;
+  G.anim = 0;
+  G.state = 'play';
+  G.solvedTimer = 0;
+  setHint('');
+  syncHud();
+  sfx(260, 0.05, 'triangle', 0.022);
+}
+
+function update(dt) {
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 3);
+  if (G.goalPulse > 0) G.goalPulse = Math.max(0, G.goalPulse - dt * 2.4);
+
+  if (G.anim < 1) G.anim = Math.min(1, G.anim + dt * 9);
+
+  if (G.state === 'solved') {
+    G.solvedTimer -= dt * 1000;
+    if (G.solvedTimer <= 0) {
+      if (G.levelIndex + 1 >= LEVELS.length) {
+        G.state = 'win';
+        showOverlay('win.title', 'win.body', 'win.hint',
+                    { moves: G.cur.moves, pushes: G.cur.pushes });
+      } else {
+        G.state = 'clear';
+        showOverlay('clear.title', 'clear.body', 'clear.hint', {
+          n: G.levelIndex + 1, moves: G.cur.moves, pushes: G.cur.pushes,
+        });
+      }
+    }
+  }
+}
+
+function render() {
+  const s = G.cur;
+  if (!s) return;
+  const cell = G.cell;
+
+  ctx.save();
+  if (G.shake > 0) {
+    const m = G.shake * G.shake * 7;
+    ctx.translate((Math.random() - 0.5) * m, (Math.random() - 0.5) * m);
+  }
+
+  ctx.fillStyle = '#0b0e15';
+  ctx.fillRect(-12, -12, W + 24, H + 24);
+
+  // 地板 + 墙
+  for (let r = 0; r < s.h; r++) {
+    for (let c = 0; c < s.w; c++) {
+      const x = G.ox + c * cell, y = G.oy + r * cell;
+      if (isWall(s, c, r)) {
+        ctx.fillStyle = '#39435a';
+        ctx.fillRect(x, y, cell, cell);
+        ctx.fillStyle = '#475273';
+        ctx.fillRect(x, y, cell, 3);
+        ctx.fillStyle = 'rgba(0,0,0,0.26)';
+        ctx.fillRect(x, y + cell - 3, cell, 3);
+      } else {
+        ctx.fillStyle = '#151b26';
+        ctx.fillRect(x, y, cell, cell);
+        ctx.fillStyle = 'rgba(255,255,255,0.028)';
+        ctx.fillRect(x, y, cell, 1);
+        ctx.fillRect(x, y, 1, cell);
+      }
+    }
+  }
+
+  // 目标点：脉动菱形
+  const pulse = 0.5 + 0.5 * Math.sin(G.goalPulse * 6 + performance.now() * 0.003);
+  for (const g of s.goals) {
+    const [c, r] = g.split(',').map(Number);
+    const x = G.ox + c * cell + cell / 2;
+    const y = G.oy + r * cell + cell / 2;
+    const size = cell * 0.16 * (1 + pulse * 0.16);
+    ctx.fillStyle = '#ffc857';
+    ctx.fillRect(x - size, y - size * 0.4, size * 2, size * 0.8);
+    ctx.fillRect(x - size * 0.4, y - size, size * 0.8, size * 2);
+    ctx.fillStyle = 'rgba(255,200,87,0.22)';
+    ctx.fillRect(x - size * 1.6, y - size * 1.6, size * 3.2, size * 3.2);
+  }
+
+  // 箱子
+  for (const b of s.boxes) {
+    const [c, r] = b.split(',').map(Number);
+    const onGoal = s.goals.has(b);
+    const pad = Math.max(2, cell * 0.09);
+    const x = G.ox + c * cell + pad, y = G.oy + r * cell + pad;
+    const sz = cell - pad * 2;
+    ctx.fillStyle = onGoal ? '#6ee7a8' : '#c9852f';
+    ctx.fillRect(x, y, sz, sz);
+    ctx.fillStyle = onGoal ? '#9df3c6' : '#e0a253';
+    ctx.fillRect(x, y, sz, Math.max(2, cell * 0.1));
+    ctx.fillRect(x, y, Math.max(2, cell * 0.1), sz);
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(x, y + sz - Math.max(2, cell * 0.1), sz, Math.max(2, cell * 0.1));
+    ctx.fillRect(x + sz - Math.max(2, cell * 0.1), y, Math.max(2, cell * 0.1), sz);
+    // 交叉绑带
+    ctx.strokeStyle = 'rgba(0,0,0,0.28)';
+    ctx.lineWidth = Math.max(1, cell * 0.06);
+    ctx.beginPath();
+    ctx.moveTo(x + 2, y + 2); ctx.lineTo(x + sz - 2, y + sz - 2);
+    ctx.moveTo(x + sz - 2, y + 2); ctx.lineTo(x + 2, y + sz - 2);
+    ctx.stroke();
+  }
+
+  // 玩家：位置在"上一格"和"这一格"之间插值，走起来是滑的
+  const t = G.anim;
+  const px = G.prevPx + (s.px - G.prevPx) * t;
+  const py = G.prevPy + (s.py - G.prevPy) * t;
+  const pad = Math.max(2, cell * 0.14);
+  const x = G.ox + px * cell + pad, y = G.oy + py * cell + pad;
+  const sz = cell - pad * 2;
+  ctx.fillStyle = '#4cc2ff';
+  ctx.fillRect(x, y, sz, sz);
+  ctx.fillStyle = '#a8e2ff';
+  ctx.fillRect(x, y, sz, Math.max(2, cell * 0.1));
+  ctx.fillStyle = '#0b0e15';
+  ctx.fillRect(x + sz * 0.2, y + sz * 0.3, sz * 0.18, sz * 0.2);
+  ctx.fillRect(x + sz * 0.62, y + sz * 0.3, sz * 0.18, sz * 0.2);
+
+  ctx.restore();
+}
+
+/* ---- 输入 ---- */
+const MOVES = {
+  ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0],
+  w: [0, -1], s: [0, 1], a: [-1, 0], d: [1, 0],
+  W: [0, -1], S: [0, 1], A: [-1, 0], D: [1, 0],
+};
+
+addEventListener('keydown', e => {
+  const k = e.key;
+  // 双语：L 键随时切换，切换后立刻重绘界面（不打断当前对局）
+  if (k === 'l' || k === 'L') { setLang(LANG === 'zh' ? 'en' : 'zh'); return; }
+  if (k === ' ' || k === 'Enter') {
+    e.preventDefault();
+    if (G.state === 'start') loadLevel(0);
+    else if (G.state === 'clear') loadLevel(G.levelIndex + 1);
+    else if (G.state === 'win') loadLevel(0);
+    else if (G.state === 'pause') { G.state = 'play'; hideOverlay(); }
+    return;
+  }
+  if (k === 'z' || k === 'Z') { undo(); return; }
+  if (k === 'r' || k === 'R') { loadLevel(G.levelIndex); return; }
+  if (k === 'Escape' && G.state === 'play') { G.state = 'pause'; showOverlay('pause.title', null, 'pause.hint'); return; }
+  const m = MOVES[k];
+  if (m) { e.preventDefault(); move(m[0], m[1]); }
+});
+
+/* ---- 主循环 ---- */
+let last = 0;
+function frame(now) {
+  if (!last) last = now;
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.25) dt = 0.25;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.__GAME__ = {
+  state: () => G.state,
+  setState: s => { G.state = s; },
+  levelIndex: () => G.levelIndex,
+  cur: () => G.cur,
+  levelCount: () => LEVELS.length,
+  playerPos: () => ({ x: G.cur.px, y: G.cur.py }),
+  boxes: () => Array.from(G.cur.boxes),
+  goals: () => Array.from(G.cur.goals),
+  moves: () => G.cur.moves,
+  pushes: () => G.cur.pushes,
+  undoDepth: () => G.undo.length,
+  boxesOnGoal: () => boxesOnGoal(G.cur),
+  isSolved: () => isSolved(G.cur),
+  isDeadlocked: () => isDeadlocked(G.cur),
+  cell: () => G.cell,
+  hintText: () => $hint.textContent,
+  start: () => loadLevel(0),
+  loadLevel: i => loadLevel(i),
+  move: (dx, dy) => move(dx, dy),
+  undo: () => undo(),
+  restart: () => loadLevel(G.levelIndex),
+  /** 一次性推入一整套移动，用来在测试里快速复现解法 */
+  applyMoves: seq => {
+    let ok = 0;
+    for (const ch of seq) {
+      const m = { U: [0, -1], D: [0, 1], L: [-1, 0], R: [1, 0] }[ch];
+      if (!m) continue;
+      const before = G.cur;
+      move(m[0], m[1]);
+      if (G.cur !== before) ok++;
+    }
+    return ok;
+  },
+  syncHud,
+  /* ---- 双语 ---- */
+  lang: () => LANG,
+  setLang,
+  t: (key, params) => T(key, params),
+  textKeys: () => Object.keys(TEXTS.zh),
+  overlayKeys: () => (overlayKeys ? { ...overlayKeys } : null),
+};
+
+/* 启动：先把语言应用到静态文本上，再同步 HUD。
+   顺序不能反 —— applyLang 会强制重写 HUD，先 syncHud 只是白做一次。 */
+syncDocLang();
+applyLang();
+</script>
+</body>
+</html>

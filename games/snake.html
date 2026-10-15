@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>贪吃蛇 · 单文件像素游戏</title>
+<style>
+  :root{
+    --bg:#0a0d13; --ink:#e8eef7; --dim:#7b8798;
+    --snake:#6ee7a8; --head:#c6ffe0; --food:#ff6b81; --wall:#2a3242;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#04060a;overflow:hidden}
+  body{font:13px/1.5 ui-monospace,"Cascadia Mono",Consolas,monospace;color:var(--ink)}
+
+  #stage{position:absolute;left:0;top:0;transform-origin:0 0}
+  #world{display:block;image-rendering:pixelated;background:var(--bg)}
+  #ui{
+    position:absolute;left:0;top:0;width:640px;height:360px;
+    transform-origin:0 0;pointer-events:none;overflow:hidden;
+  }
+
+  .hud{
+    position:absolute;left:0;top:0;width:100%;
+    display:flex;justify-content:space-between;align-items:center;
+    padding:10px 16px;font-size:14px;letter-spacing:.06em;
+  }
+  .hud b{font-weight:500;color:var(--dim);font-size:12px}
+  #hudBest{color:var(--dim)}
+  #hudSpeed{color:var(--food)}
+
+  .overlay{
+    position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:10px;
+    background:rgba(4,6,10,.84);text-align:center;padding:24px;
+  }
+  .overlay:not(.on){display:none}
+  .overlay:not(.on) *{pointer-events:none}
+  .overlay.on{pointer-events:auto}
+  #ovTitle{font-size:26px;font-weight:500;letter-spacing:.1em}
+  #ovBody{color:var(--dim);font-size:13px;max-width:430px;line-height:1.8}
+  #ovHint{color:var(--snake);font-size:12px;margin-top:6px;letter-spacing:.08em}
+  .keys{color:var(--food)}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="world" width="640" height="360"></canvas>
+  <div id="ui">
+    <div class="hud">
+      <span><b id="lblScore">长度</b> <span id="hudScore">3</span></span>
+      <span><b id="lblBest">最高</b> <span id="hudBest">0</span></span>
+      <span id="hudSpeed">×1.0</span>
+    </div>
+    <div id="ov" class="overlay on">
+      <h1 id="ovTitle">贪吃蛇</h1>
+      <p id="ovBody">方向键或 WASD 转向。撞墙、撞到自己都会结束。<br>
+        吃到食物会变长并加速 —— 速度上限设在 ×2.2，再快就不是人玩的了。</p>
+      <p id="ovHint">按 空格 开始</p>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+
+/* #region CORE
+   纯算法区。这个游戏最值得学的地方全在这里：
+   把"推进一格"写成一个**纯函数** —— 进来一个状态、出去一个新状态，
+   不读任何全局变量、不改任何外部对象。带来的好处很直接：
+     · 测试可以在毫秒内推进一万步，不需要渲染
+     · 想加"回放/录像"只需要存下状态序列
+     · 想加"预测玩家三步后的位置"直接调三次就够了
+   反面写法是"在 update 里就地改 G.snake" —— 那样什么都测不了。 */
+const CORE = (function () {
+
+  const DIRS = {
+    up:    { x: 0, y: -1, name: 'up' },
+    down:  { x: 0, y: 1,  name: 'down' },
+    left:  { x: -1, y: 0, name: 'left' },
+    right: { x: 1,  y: 0, name: 'right' },
+  };
+  const OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left' };
+
+  function makeRNG(seed) {
+    let a = (seed >>> 0) || 1;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /**
+   * 转向缓冲：一次可以排队两拍。
+   *
+   * 这是整个游戏手感的关键，也是最容易被忽略的一处。
+   * 只记"当前方向"的话，玩家在一个 tick 内快速按 上→左 ，
+   * 第二次按键会覆盖第一次，蛇直接往左走 —— 看起来像"漏了一次输入"。
+   * 正确做法是把转向存成队列，每个 tick 消费一个。
+   */
+  function queueTurn(queue, currentDir, want, maxQueued) {
+    const cap = maxQueued == null ? 2 : maxQueued;
+    const last = queue.length ? queue[queue.length - 1] : currentDir;
+    if (!DIRS[want]) return queue;                 // 未知方向忽略
+    if (want === last) return queue;               // 同方向不算转向
+    if (want === OPPOSITE[last]) return queue;     // 禁止 180° 掉头
+    if (queue.length >= cap) return queue;         // 队列满了就丢弃
+    return queue.concat(want);
+  }
+
+  /** 在空格子里随机放一个食物。找不到空格（满屏）时返回 null。 */
+  function spawnFood(occupied, cols, rows, rng) {
+    const taken = new Set(occupied.map(c => c.x + ',' + c.y));
+    const free = [];
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        if (!taken.has(x + ',' + y)) free.push({ x, y });
+      }
+    }
+    if (!free.length) return null;
+    return free[Math.min(free.length - 1, Math.floor(rng() * free.length))];
+  }
+
+  function initialState(cols, rows, rng, length) {
+    const len = length || 3;
+    const cy = Math.floor(rows / 2);
+    const cx = Math.floor(cols / 3);
+    const body = [];
+    for (let i = 0; i < len; i++) body.push({ x: cx - i, y: cy });
+    const state = {
+      body,
+      dir: 'right',
+      queue: [],
+      food: null,
+      score: len,
+      alive: true,
+      won: false,
+      ticks: 0,
+    };
+    state.food = spawnFood(body, cols, rows, rng);
+    return state;
+  }
+
+  /**
+   * 推进一个 tick。纯函数：输入状态，返回新状态 + 发生了什么。
+   *
+   * 返回值里带 event（move / eat / die / win）而不是让调用方去比对
+   * 前后差异 —— 事件在生成的那一瞬间是最明确的，事后再推断容易出错。
+   */
+  function step(state, cols, rows, rng) {
+    if (!state.alive || state.won) return { state, event: 'none' };
+
+    const queue = state.queue.slice();
+    let dir = state.dir;
+    if (queue.length) dir = queue.shift();
+
+    const d = DIRS[dir];
+    const head = state.body[0];
+    const nx = head.x + d.x;
+    const ny = head.y + d.y;
+
+    // 撞墙
+    if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) {
+      return { state: { ...state, dir, queue, alive: false }, event: 'die' };
+    }
+
+    const willEat = !!(state.food && nx === state.food.x && ny === state.food.y);
+
+    /* 生长不需要额外的计数器:吃到食物那一 tick 不弹尾巴,
+       长度自然 +1。早先这里多写了一个 grow 累加器,结果是
+       "每吃一次长两节" —— 而且因为蛇确实变长了,肉眼很难发现。 */
+    const body = [{ x: nx, y: ny }].concat(state.body);
+    if (!willEat) body.pop();
+
+    /* 撞自己。注意尾部例外:不生长时尾巴这一 tick 会让开,
+       所以"追着自己的尾巴走"是合法的 —— 漏掉这个例外会让玩家
+       在蛇很长时莫名其妙地死掉,而且看起来像是判定不准。 */
+    const limit = willEat ? state.body.length : state.body.length - 1;
+    for (let i = 0; i < limit; i++) {
+      if (state.body[i].x === nx && state.body[i].y === ny) {
+        return { state: { ...state, dir, queue, alive: false }, event: 'die' };
+      }
+    }
+
+    let score = state.score + (willEat ? 1 : 0);
+    let food = state.food;
+    let won = false;
+
+    if (willEat) {
+      const next = spawnFood(body, cols, rows, rng);
+      if (!next) { won = true; food = null; }
+      else food = next;
+    }
+
+    return {
+      state: {
+        ...state, body, dir, queue, food, score,
+        alive: true, won, ticks: state.ticks + 1,
+      },
+      event: won ? 'win' : (willEat ? 'eat' : 'move'),
+    };
+  }
+
+  /** 速度曲线：每吃一个加速一点，但有上限 —— 无上限会让后期变成摸黑送死 */
+  function tickInterval(score, base, minInterval, perFood) {
+    const t = base - (score - 3) * perFood;
+    return Math.max(minInterval, t);
+  }
+
+  /** 线性插值：渲染时用它把"格"补成"连续移动" */
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  return { DIRS, OPPOSITE, makeRNG, queueTurn, spawnFood, initialState, step, tickInterval, lerp };
+})();
+/* #endregion CORE */
+
+/* ================================================================== */
+
+const { DIRS, makeRNG, queueTurn, initialState, step, tickInterval, lerp } = CORE;
+
+const W = 640, H = 360;
+const CELL = 16;
+const COLS = 38, ROWS = 19;
+const FX = Math.round((W - COLS * CELL) / 2);       // 场地左边界（16）
+const FY = 44;                                       // 场地顶边（给 HUD 留位）
+
+const cvs = document.getElementById('world');
+const ctx = cvs.getContext('2d');
+const ui = document.getElementById('ui');
+const stage = document.getElementById('stage');
+const $score = document.getElementById('hudScore');
+const $lblScore = document.getElementById('lblScore');
+const $lblBest = document.getElementById('lblBest');
+const $best = document.getElementById('hudBest');
+const $speed = document.getElementById('hudSpeed');
+const $ov = document.getElementById('ov');
+const $ovTitle = document.getElementById('ovTitle');
+const $ovBody = document.getElementById('ovBody');
+const $ovHint = document.getElementById('ovHint');
+
+/* ==================================================================
+   语言：两种语言都装在这一个文件里。
+
+   为什么不做成 snake.en.html：那是两份要各自维护的代码，改一个 bug
+   得改两遍，迟早不一致。装在同一文件里，双语共用同一套逻辑，
+   只把文本抽出来 —— 也让测试能断言两种语言的键完全对齐。
+
+   检测顺序：URL 参数 ?lang=en  >  上次手动选择  >  浏览器语言
+   手动切换：按 L
+   ================================================================== */
+const TEXTS = {
+  zh: {
+    'doc.title': '贪吃蛇 · 单文件像素游戏',
+    'hud.score': '长度',
+    'hud.best': '最高',
+    'start.title': '贪吃蛇',
+    'start.body': '方向键或 WASD 转向。撞墙、撞到自己都会结束。<br>吃到食物会变长并加速 —— 速度上限设在 ×2.2，再快就不是人玩的了。',
+    'start.hint': '按 空格 开始',
+    'win.title': '填满了',
+    'win.body': '长度 <span class="keys">{score}</span> —— 整个场地都被你占了。',
+    'win.hint': '按 空格 再来一局',
+    'over.title': '游戏结束',
+    'over.bodyBest': '长度 <span class="keys">{score}</span>　最高 {best}<br>这是目前最好的一局。',
+    'over.bodyAgain': '长度 <span class="keys">{score}</span>　最高 {best}<br>再来一次？',
+    'over.hint': '按 空格 重新开始',
+    'pause.title': '已暂停',
+    'pause.hint': '按 空格 继续',
+  },
+  en: {
+    'doc.title': 'Snake · Single-file pixel game',
+    'hud.score': 'LENGTH',
+    'hud.best': 'BEST',
+    'start.title': 'Snake',
+    'start.body': 'Steer with the arrow keys or WASD. Hitting a wall or yourself ends the run.<br>Eating grows the snake and speeds it up — capped at ×2.2, past which it stops being playable.',
+    'start.hint': 'Press SPACE to start',
+    'win.title': 'Board Filled',
+    'win.body': 'Length <span class="keys">{score}</span> — you took over the entire board.',
+    'win.hint': 'Press SPACE for another run',
+    'over.title': 'Game Over',
+    'over.bodyBest': 'Length <span class="keys">{score}</span>　best {best}<br>That is your best run yet.',
+    'over.bodyAgain': 'Length <span class="keys">{score}</span>　best {best}<br>Try again?',
+    'over.hint': 'Press SPACE to play again',
+    'pause.title': 'Paused',
+    'pause.hint': 'Press SPACE to resume',
+  },
+};
+
+function detectLang() {
+  // 1) URL 参数 —— 最高优先级，方便分享指定语言的链接
+  try {
+    const m = (window.location && window.location.search || '').match(/[?&]lang=(zh|en)\b/);
+    if (m) return m[1];
+  } catch (e) { /* file:// 下访问 location 可能受限 */ }
+
+  // 2) 上次的选择 —— 也要能读得到，否则刷新就跳回浏览器语言
+  try {
+    const saved = window.localStorage.getItem('sfpg.lang');
+    if (saved === 'zh' || saved === 'en') return saved;
+  } catch (e) { /* 隐私模式下会抛异常 */ }
+
+  // 3) 浏览器语言
+  try {
+    const nav = window.navigator || {};
+    const tag = nav.language || (nav.languages && nav.languages[0]) || '';
+    if (tag) return /^zh\b/i.test(tag) ? 'zh' : 'en';
+  } catch (e) { /* 忽略 */ }
+
+  return 'zh';   // 兜底：项目原始语言
+}
+
+let LANG = detectLang();
+
+/** 取文本。params 里的值会替换模板里的 {name} 占位符。 */
+function T(key, params) {
+  const table = TEXTS[LANG] || TEXTS.zh;
+  let s = Object.prototype.hasOwnProperty.call(table, key)
+    ? table[key]
+    : (TEXTS.zh[key] != null ? TEXTS.zh[key] : key);
+  if (params) {
+    s = s.replace(/\{(\w+)\}/g, (whole, name) =>
+      Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : whole);
+  }
+  return s;
+}
+
+/** 把语言同步到 <html lang> 和 <title>。给无障碍工具和搜索引擎看的。 */
+function syncDocLang() {
+  try { document.documentElement.setAttribute('lang', LANG === 'zh' ? 'zh-CN' : 'en'); } catch (e) { /* 忽略 */ }
+  try { document.title = T('doc.title'); } catch (e) { /* 忽略 */ }
+}
+
+function setLang(next) {
+  if (next !== 'zh' && next !== 'en') return;
+  LANG = next;
+  try { window.localStorage.setItem('sfpg.lang', LANG); } catch (e) { /* 降级 */ }
+  syncDocLang();
+  applyLang();
+}
+
+/* ---- 覆盖层：记住"当前该显示哪条文案"，而不是记住渲染好的字符串 ----
+   这样按 L 切语言时可以直接重绘，不需要每个调用点各写一遍刷新逻辑。
+
+   注意：**必须一开始就设好 overlayKeys**。放开局画面时它是 null 的话，
+   paintOverlay 会直接返回，于是"开局时按 L 切换语言"对开始界面毫无效果 ——
+   而其余场景（结算、通关）却是正常的，这种"只在某一屏失效"最难查。 */
+let overlayKeys = { titleKey: 'start.title', bodyKey: 'start.body', hintKey: 'start.hint', params: null };
+
+function showOverlay(titleKey, bodyKey, hintKey, params) {
+  overlayKeys = { titleKey, bodyKey, hintKey, params: params || null };
+  paintOverlay();
+  $ov.classList.add('on');
+}
+
+function paintOverlay() {
+  if (!overlayKeys) return;
+  const { titleKey, bodyKey, hintKey, params } = overlayKeys;
+  $ovTitle.textContent = T(titleKey, params);
+  if (bodyKey) $ovBody.innerHTML = T(bodyKey, params);
+  $ovHint.textContent = T(hintKey, params);
+}
+
+/** 切换语言时刷新静态文本；动态数值交给 syncHud */
+function applyLang() {
+  $lblScore.textContent = T('hud.score');
+  $lblBest.textContent = T('hud.best');
+  paintOverlay();
+  syncHud(true);      // 强制重写：等级栏之类的格式可能随语言变化
+}
+
+
+/* ---- 调参区 ---- */
+const BASE_INTERVAL = 132;   // 起始每格毫秒数
+const MIN_INTERVAL = 58;     // 上限速度（约 ×2.2）
+const PER_FOOD = 2.6;        // 每吃一个减少的毫秒
+const DEATH_HOLD = 380;      // 死亡后停顿多久再弹面板
+
+const G = {
+  state: 'start',        // start | play | pause | dead | win
+  cols: COLS, rows: ROWS,
+  game: null,            // CORE 里的那个纯状态对象
+  prev: [],              // 上一 tick 的身体，用于插值渲染
+  acc: 0,
+  interval: BASE_INTERVAL,
+  best: 0,
+  rng: makeRNG(20261015),
+  shake: 0,
+  flash: 0,
+  deathTimer: 0,
+  seed: 20261015,
+};
+
+/* ---- 最高分存档：localStorage 在隐私模式/某些 file:// 下会抛异常，
+   必须探测可用性并降级到内存，否则游戏会在"存档"这一步直接崩掉。 ---- */
+const memStore = {};
+function storageGet(key) {
+  try {
+    const v = window.localStorage.getItem(key);
+    return v == null ? memStore[key] ?? null : v;
+  } catch (e) { return memStore[key] ?? null; }
+}
+function storageSet(key, value) {
+  memStore[key] = String(value);
+  try { window.localStorage.setItem(key, String(value)); } catch (e) { /* 降级到内存 */ }
+}
+G.best = parseInt(storageGet('snake.best') || '0', 10) || 0;
+
+let actx = null;
+function sfx(freq, dur, type, gain) {
+  try {
+    if (typeof AudioContext === 'undefined') return;
+    if (!actx) actx = new AudioContext();
+    if (actx.state === 'suspended' && actx.resume) actx.resume();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'square';
+    o.frequency.value = freq;
+    g.gain.value = gain == null ? 0.03 : gain;
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch (e) { /* 没声音也不能没游戏 */ }
+}
+
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const s = Math.max(1, Math.floor(Math.min(vw / W, vh / H)));
+  cvs.style.width = (W * s) + 'px';
+  cvs.style.height = (H * s) + 'px';
+  ui.style.transform = 'scale(' + s + ')';
+  stage.style.left = Math.round((vw - W * s) / 2) + 'px';
+  stage.style.top = Math.round((vh - H * s) / 2) + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+function hideOverlay() { $ov.classList.remove('on'); }
+
+function startRun(seed) {
+  G.seed = seed == null ? (Date.now() & 0x7fffffff) : seed;
+  G.rng = makeRNG(G.seed);
+  G.game = initialState(COLS, ROWS, G.rng, 3);
+  G.prev = G.game.body.map(c => ({ ...c }));
+  G.acc = 0;
+  G.interval = BASE_INTERVAL;
+  G.state = 'play';
+  G.shake = 0; G.flash = 0; G.deathTimer = 0;
+  hideOverlay();
+  syncHud();
+}
+
+const hudCache = {};
+function setText(el, key, value, force) {
+  if (!force && hudCache[key] === value) return;
+  hudCache[key] = value;
+  el.textContent = value;
+}
+
+function syncHud(force) {
+  setText($score, 'score', String(G.game ? G.game.score : 3), force);
+  setText($best, 'best', String(G.best), force);
+  const mul = BASE_INTERVAL / G.interval;
+  setText($speed, 'speed', '×' + mul.toFixed(1), force);
+}
+
+/** 推进一步：把纯函数的结果接回游戏层，并处理事件副作用 */
+function tick() {
+  const before = G.game.body;
+  const r = step(G.game, COLS, ROWS, G.rng);
+  G.prev = before;                       // 插值用：旧身体
+  G.game = r.state;
+  G.interval = tickInterval(G.game.score, BASE_INTERVAL, MIN_INTERVAL, PER_FOOD);
+
+  if (r.event === 'eat') {
+    sfx(720 + (G.game.score % 6) * 60, 0.06, 'square', 0.03);
+    if (G.game.score > G.best) {
+      G.best = G.game.score;
+      storageSet('snake.best', G.best);
+    }
+    syncHud();
+  } else if (r.event === 'die') {
+    G.state = 'dead';
+    G.shake = 1;
+    G.flash = 1;
+    G.deathTimer = DEATH_HOLD;
+    sfx(140, 0.32, 'sawtooth', 0.05);
+    if (G.game.score > G.best) { G.best = G.game.score; storageSet('snake.best', G.best); }
+    syncHud();
+  } else if (r.event === 'win') {
+    G.state = 'win';
+    sfx(980, 0.4, 'triangle', 0.05);
+    showOverlay('win.title', 'win.body', 'win.hint', { score: G.game.score });
+  }
+}
+
+function update(dt) {
+  const ms = dt * 1000;
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 2.4);
+  if (G.flash > 0) G.flash = Math.max(0, G.flash - dt * 3.2);
+
+  if (G.state === 'dead') {
+    G.deathTimer -= ms;
+    if (G.deathTimer <= 0) {
+      showOverlay('over.title',
+        (G.game.score >= G.best && G.game.score > 3) ? 'over.bodyBest' : 'over.bodyAgain',
+        'over.hint', { score: G.game.score, best: G.best });
+    }
+    return;
+  }
+  if (G.state !== 'play') return;
+
+  G.acc += ms;
+  // while 而非 if：长帧（切标签页回来）要补上欠下的 tick，
+  // 但也要有上限，否则会一口气推几十步把蛇直接推死
+  let guard = 0;
+  while (G.acc >= G.interval && guard < 4 && G.state === 'play') {
+    G.acc -= G.interval;
+    tick();
+    guard++;
+  }
+  if (G.acc > G.interval) G.acc = 0;
+}
+
+function render() {
+  const t = Math.max(0, Math.min(1, G.acc / G.interval));
+
+  ctx.save();
+  if (G.shake > 0) {
+    const m = G.shake * G.shake * 9;
+    ctx.translate((G.rng() - 0.5) * m, (G.rng() - 0.5) * m);
+  }
+
+  ctx.fillStyle = '#0a0d13';
+  ctx.fillRect(-12, -12, W + 24, H + 24);
+
+  // 场地底与网格
+  ctx.fillStyle = '#0d1119';
+  ctx.fillRect(FX, FY, COLS * CELL, ROWS * CELL);
+  ctx.fillStyle = 'rgba(255,255,255,0.028)';
+  for (let x = 0; x <= COLS; x++) ctx.fillRect(FX + x * CELL, FY, 1, ROWS * CELL);
+  for (let y = 0; y <= ROWS; y++) ctx.fillRect(FX, FY + y * CELL, COLS * CELL, 1);
+
+  // 边框
+  ctx.fillStyle = '#2a3242';
+  ctx.fillRect(FX - 2, FY - 2, COLS * CELL + 4, 2);
+  ctx.fillRect(FX - 2, FY + ROWS * CELL, COLS * CELL + 4, 2);
+  ctx.fillRect(FX - 2, FY, 2, ROWS * CELL);
+  ctx.fillRect(FX + COLS * CELL, FY, 2, ROWS * CELL);
+
+  if (G.game) {
+    const body = G.game.body;
+    const prev = G.prev;
+    const dead = G.state === 'dead';
+
+    // 食物：带一点脉动，让静止画面里有个"动的东西"
+    if (G.game.food) {
+      const pulse = 0.5 + 0.5 * Math.sin(G.game.ticks * 0.5 + perfNow() * 0.004);
+      const pad = 2 + pulse * 1.5;
+      ctx.fillStyle = '#ff6b81';
+      ctx.fillRect(FX + G.game.food.x * CELL + pad, FY + G.game.food.y * CELL + pad,
+                   CELL - pad * 2, CELL - pad * 2);
+      ctx.fillStyle = 'rgba(255,107,129,0.28)';
+      ctx.fillRect(FX + G.game.food.x * CELL + pad - 2, FY + G.game.food.y * CELL + pad - 2,
+                   CELL - pad * 2 + 4, CELL - pad * 2 + 4);
+    }
+
+    /* 插值渲染：逻辑是离散的（一格一格跳），画面是连续的。
+       每个身体块在"上一 tick 的位置"和"这一 tick 的位置"之间插值，
+       于是蛇看起来是平滑爬行而不是瞬移。
+       prev 比 body 短一块的情况出现在刚吃到食物那一 tick ——
+       此时最后一块直接画在原地（它本来就不会动）。 */
+    for (let i = body.length - 1; i >= 0; i--) {
+      const cur = body[i];
+      const old = prev[i] || cur;
+      const x = lerp(old.x, cur.x, t);
+      const y = lerp(old.y, cur.y, t);
+      const isHead = i === 0;
+      const inset = isHead ? 1 : 2;
+      ctx.fillStyle = dead ? '#5a6577' : (isHead ? '#c6ffe0' : '#6ee7a8');
+      ctx.fillRect(FX + x * CELL + inset, FY + y * CELL + inset,
+                   CELL - inset * 2, CELL - inset * 2);
+      if (isHead && !dead) {
+        // 眼睛，指出当前朝向 —— 小细节，但玩家靠它判断"下一步会往哪走"
+        const d = DIRS[G.game.dir];
+        ctx.fillStyle = '#0a0d13';
+        const ex = FX + x * CELL + CELL / 2 + d.x * 4;
+        const ey = FY + y * CELL + CELL / 2 + d.y * 4;
+        const px = d.x === 0 ? 3 : 0, py = d.y === 0 ? 3 : 0;
+        ctx.fillRect(ex - 2 - px, ey - 2 - py, 2, 2);
+        ctx.fillRect(ex - 2 + px, ey - 2 + py, 2, 2);
+      }
+    }
+  }
+
+  if (G.flash > 0) {
+    ctx.fillStyle = 'rgba(255,80,110,' + (G.flash * 0.3) + ')';
+    ctx.fillRect(-12, -12, W + 24, H + 24);
+  }
+  ctx.restore();
+}
+
+/* 让食物脉动用真实时间而不是 tick —— tick 会随速度变快而抖动 */
+let _now = 0;
+function perfNow() { return _now; }
+
+/* ---- 输入 ---- */
+const KEYMAP = {
+  ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
+  w: 'up', s: 'down', a: 'left', d: 'right',
+  W: 'up', S: 'down', A: 'left', D: 'right',
+};
+
+addEventListener('keydown', e => {
+  const k = e.key;
+  // 双语：L 键随时切换，切换后立刻重绘界面（不打断当前对局）
+  if (k === 'l' || k === 'L') { setLang(LANG === 'zh' ? 'en' : 'zh'); return; }
+  if (k === ' ' || k === 'Enter') {
+    e.preventDefault();
+    if (G.state === 'start') startRun();
+    else if (G.state === 'dead' || G.state === 'win') startRun(G.seed);
+    else if (G.state === 'play') { G.state = 'pause'; showOverlay('pause.title', null, 'pause.hint'); }
+    else if (G.state === 'pause') { G.state = 'play'; hideOverlay(); }
+    return;
+  }
+  if (k === 'r' || k === 'R') { startRun(G.seed); return; }
+  const want = KEYMAP[k];
+  if (want && G.game) {
+    e.preventDefault();
+    G.game.queue = queueTurn(G.game.queue, G.game.dir, want, 2);
+  }
+});
+
+/* ---- 主循环 ---- */
+let last = 0;
+function frame(now) {
+  if (!last) last = now;
+  let dt = (now - last) / 1000;
+  last = now;
+  _now = now;
+  if (dt > 0.25) dt = 0.25;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.__GAME__ = {
+  state: () => G.state,
+  setState: s => { G.state = s; },
+  game: () => G.game,
+  body: () => (G.game ? G.game.body : []),
+  score: () => (G.game ? G.game.score : 0),
+  best: () => G.best,
+  food: () => (G.game ? G.game.food : null),
+  dir: () => (G.game ? G.game.dir : null),
+  queue: () => (G.game ? G.game.queue : []),
+  interval: () => G.interval,
+  seed: () => G.seed,
+  acc: () => G.acc,
+  setSeed: n => { G.rng = makeRNG(n); },
+  start: (seed) => startRun(seed),
+  /** 直接推进一步，绕过计时器 —— 测试用它精确驱动 */
+  tick: () => tick(),
+  turn: want => { if (G.game) G.game.queue = queueTurn(G.game.queue, G.game.dir, want, 2); },
+  /** 把食物放到指定格子，用来确定性地构造"吃到"的场景 */
+  placeFood: (x, y) => { if (G.game) G.game.food = { x, y }; },
+  /** 把蛇摆成指定形状，用来测自撞 */
+  setBody: (cells, dir) => {
+    if (!G.game) return;
+    G.game.body = cells.map(c => ({ x: c[0], y: c[1] }));
+    G.prev = G.game.body.map(c => ({ ...c }));
+    if (dir) G.game.dir = dir;
+    G.game.score = G.game.body.length;
+    syncHud();
+  },
+  syncHud,
+  /* ---- 双语 ---- */
+  lang: () => LANG,
+  setLang,
+  t: (key, params) => T(key, params),
+  textKeys: () => Object.keys(TEXTS.zh),
+  overlayKeys: () => (overlayKeys ? { ...overlayKeys } : null),
+};
+
+/* 启动：先把语言应用到静态文本上，再同步 HUD。
+   顺序不能反 —— applyLang 会强制重写 HUD，先 syncHud 只是白做一次。 */
+syncDocLang();
+applyLang();
+</script>
+</body>
+</html>

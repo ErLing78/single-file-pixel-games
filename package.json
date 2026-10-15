@@ -1,0 +1,32 @@
+{
+  "name": "single-file-pixel-games",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Five tiny pixel games, each a single HTML file with no dependencies — built to be read, played and modified",
+  "scripts": {
+    "test": "node tests/core.test.mjs && node tests/smoke.test.mjs && node tests/systems.test.mjs && node tests/dom-check.mjs && node tests/readme.test.mjs",
+    "test:core": "node tests/core.test.mjs",
+    "test:smoke": "node tests/smoke.test.mjs",
+    "test:systems": "node tests/systems.test.mjs",
+    "test:dom": "node tests/dom-check.mjs",
+    "test:readme": "node tests/readme.test.mjs",
+    "serve": "python -m http.server 8000"
+  },
+  "keywords": [
+    "pixel-art",
+    "games",
+    "single-file",
+    "html5",
+    "canvas",
+    "vanilla-js",
+    "no-dependencies",
+    "templates",
+    "tutorial"
+  ],
+  "license": "MIT",
+  "author": "ErLing78",
+  "engines": {
+    "node": ">=18"
+  }
+}
