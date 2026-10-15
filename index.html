@@ -82,13 +82,14 @@
     <p class="lede">
       没有构建步骤、没有 npm、没有 CDN —— 双击就能玩，另存就能改。界面中英双语，按 <b>L</b> 切换。
       每个文件内部按 <code>算法区</code> / <code>游戏层</code> 分层，算法区不碰 DOM，
-      所以能被单独抠出来做单元测试。五个游戏合起来有 <b>850 条自动化断言</b> 在跑。
+      所以能被单独抠出来做单元测试。五个游戏合起来有 <b>862 条自动化断言</b> 在跑。
     </p>
     <div class="meta">
       <span><i class="dot"></i>零依赖 · 完全离线</span>
       <span><i class="dot"></i>640×360 像素画布</span>
       <span><i class="dot"></i>中英双语界面</span>
       <span><i class="dot"></i>MIT 许可</span>
+      <span><i class="dot"></i><a href="https://erling78.github.io/single-file-pixel-games/" style="color:var(--b)">erling78.github.io/single-file-pixel-games</a></span>
     </div>
   </header>
 
@@ -202,7 +203,9 @@
   <section class="how">
     <h3>怎么跑</h3>
     <p style="color:var(--dim);font-size:14px;margin-bottom:14px">
-      直接双击任意 <code style="color:var(--b)">games/*.html</code> 即可。要让五个游戏在同一站点里互相跳转，用任意静态服务器：
+      <b style="color:var(--b)">你现在打开的这页就是线上版</b>，点上面的卡片直接玩。
+      想放到自己机器上：直接双击任意 <code style="color:var(--b)">games/*.html</code> 即可 —— 单个游戏是自包含的。
+      要让五个游戏互相跳转，用任意静态服务器：
     </p>
     <pre><span class="cmt"># 任选一种，都不需要装任何东西</span>
 python -m http.server 8000
@@ -214,11 +217,11 @@ npx serve .
     <pre>node tests/core.test.mjs      <span class="cmt"># 算法单元测试（196 项）</span>
 node tests/smoke.test.mjs     <span class="cmt"># 端到端冒烟测试（158 项）</span>
 node tests/systems.test.mjs   <span class="cmt"># 规则与平衡测试（256 项）</span>
-node tests/dom-check.mjs      <span class="cmt"># 静态一致性检查（240 项）</span>
+node tests/dom-check.mjs      <span class="cmt"># 静态一致性检查（252 项）</span>
 node tests/readme.test.mjs    <span class="cmt"># 文档一致性检查（不计入上面的总数）</span>
 
 npm test                      <span class="cmt"># 一次跑完</span>
-<span class="ok">→ 850 项全部通过</span></pre>
+<span class="ok">→ 862 项全部通过</span></pre>
     <p style="color:var(--faint);font-size:13px;margin-top:12px">
       不需要 npm install —— 测试只用 Node 内置模块。
     </p>

@@ -94,13 +94,27 @@ export function referencedIds(script) {
 /**
  * 外部资源引用。命中任何一条都说明这个文件不能离线运行 ——
  * "零依赖可离线"是这类单文件游戏的核心承诺，必须守住。
+ *
+ * 关键区别：**资源加载 vs 导航链接**。
+ *   · `<script src>`、`<img src>`、`<link href>`、`fetch()` —— 会发起请求，
+ *     离线时必然失败，必须禁止。
+ *   · `<a href="https://...">` —— 就是个超链接，不点它不会加载任何东西。
+ *     落地页指向自己的线上地址是正常且有用的，不该被当成依赖。
+ *
+ * 早先这里用 `\b(?:src|href)\s*=` 一条通吃，于是 index.html 里加一个
+ * 指向 GitHub Pages 的 `<a>` 就被误报成"有外部依赖"。检查器太粗会
+ * 逼着人去绕过它，那比没有检查更糟。
  */
 export function externalRefs(html) {
   const hits = [];
   const patterns = [
-    [/<script[^>]+\bsrc\s*=/gi, 'script src'],
-    [/<link[^>]+\bhref\s*=\s*["']?(?!#)[^"'>]+/gi, 'link href'],
-    [/\b(?:src|href)\s*=\s*["'](?:https?:)?\/\//gi, 'protocol-relative or absolute URL'],
+    /* src 只在**标签内部**才是属性。
+       不加 `<[a-zA-Z][^>]*` 这个前缀的话，`const src = G.balls.slice(...)`
+       这样的普通变量声明也会被当成外部资源 —— 实测过，五个游戏里
+       打砖块就有一个叫 src 的局部变量。 */
+    [/<[a-zA-Z][^>]*\bsrc\s*=\s*["']?(?!data:)[^"'\s>]+/gi, 'src attribute'],
+    /* <link> 的 href 同理（样式表、图标）。data: 是内联的，不算外部依赖。 */
+    [/<link\b[^>]*\bhref\s*=\s*["']?(?!#|data:)[^"'\s>]+/gi, 'link href'],
     [/@import\s+(?:url\()?["']/gi, 'CSS @import'],
     [/\bfetch\s*\(/g, 'fetch()'],
     [/\bXMLHttpRequest\b/g, 'XMLHttpRequest'],
@@ -111,6 +125,15 @@ export function externalRefs(html) {
     if (found) hits.push(label + ' × ' + found.length);
   }
   return hits;
+}
+
+/**
+ * 导航型外链（`<a href="http...">`）。这些**不算**依赖，
+ * 但数量值得单独统计 —— 落地页指向自己的线上地址是正常的。
+ */
+export function navigationLinks(html) {
+  return [...html.matchAll(/<a\b[^>]*\bhref\s*=\s*["'](https?:\/\/[^"']+)["']/gi)]
+    .map(m => m[1]);
 }
 
 /** 标签开闭是否配平（只查我们实际会用的那几个） */

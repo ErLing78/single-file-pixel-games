@@ -13,7 +13,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { readGame, GAMES, ROOT, declaredIds, referencedIds, externalRefs, tagBalance } from './lib/load.mjs';
+import { readGame, GAMES, ROOT, declaredIds, referencedIds, externalRefs, navigationLinks, tagBalance } from './lib/load.mjs';
 import { createReporter } from './lib/env.mjs';
 
 const r = createReporter('dom-check —— 静态一致性');
@@ -467,6 +467,34 @@ r.group('自检：静态检查本身有效吗');
 
   const offlineOk = '<script>var a=1;</script>';
   r.ok(externalRefs(offlineOk).length === 0, '合成样本：纯内联脚本不误报');
+
+  /* 资源加载 vs 导航链接的区别。
+     这条自检是有来历的：index.html 里加了一个指向自己线上地址的
+     <a href="https://...">，旧检查器用 `src|href` 一条通吃，把它
+     误报成了"外部依赖"。太粗的检查会逼人去绕过它，比没有更糟。 */
+  const resourceCases = [
+    ['<link rel="stylesheet" href="https://x.com/a.css">', true, '外部样式表'],
+    ['<script src="./local.js"></script>', true, '本地脚本文件'],
+    ['<img src="https://x.com/a.png">', true, '外部图片'],
+    ['<img src="data:image/png;base64,iVBORw0KGgo=">', false, '内联 data: 图片'],
+    ['<a href="https://example.com/">外链</a>', false, '纯导航超链接'],
+    ['<a href="games/breakout.html">游戏</a>', false, '站内链接'],
+    ['<script>fetch("/api")</script>', true, 'fetch 调用'],
+    ['<link rel="icon" href="data:,">', false, '内联 favicon'],
+    ['<script>const src = list.slice(0, 3);</script>', false, '名叫 src 的普通变量'],
+    ['<script>const img = new Image(); img.src = url;</script>', false, '运行时赋值的 src'],
+  ];
+  for (const [html, shouldFlag, label] of resourceCases) {
+    const got = externalRefs(html).length > 0;
+    r.ok(got === shouldFlag, `自检：${label} ${shouldFlag ? '要被拦' : '不该误报'}`,
+         externalRefs(html).join('; ') || '无命中');
+  }
+
+  // 导航外链单独统计，不算依赖
+  const nav = navigationLinks('<a href="https://example.com/x">x</a>');
+  r.ok(nav.length === 1, '自检：导航外链能被单独识别', nav.join(', '));
+  r.ok(externalRefs('<a href="https://example.com/x">x</a>').length === 0,
+       '自检：导航外链不计入外部依赖');
 }
 
 /* ==================================================================
